@@ -1,0 +1,14 @@
+{
+  "name": "deepseek-quake",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Quake-style drop-down shell for DeepSeek web: global hotkey to toggle, hidden from Alt+Tab and taskbar",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron . --no-sandbox",
+    "dev": "electron . --no-sandbox --dev"
+  },
+  "devDependencies": {
+    "electron": "^44.4.5"
+  }
+}

@@ -1,0 +1,16 @@
+# 忽略浏览器配置文件，绝对不要上传这些
+chrome-profile/
+
+# 忽略生成的可执行文件和快捷方式（建议通过 Releases 发布）
+*.exe
+*.lnk
+
+# 忽略系统缓存和测试文件
+audit/
+backup/
+diag/
+recon/
+verify/
+
+# 忽略配置文件（根据情况决定是否保留）
+hotkey.conf

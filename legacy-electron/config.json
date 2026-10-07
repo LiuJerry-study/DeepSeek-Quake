@@ -1,0 +1,18 @@
+{
+  "_说明": "改完保存后需重启客户端：托盘右键 → 退出，再运行 start-deepseek.vbs。hotkey 用 Electron accelerator 语法（Super = Win 键）。",
+  "url": "https://chat.deepseek.com",
+  "hotkey": "Super+Shift+D",
+  "fallbackHotkeys": ["Super+Shift+`", "Alt+Shift+D"],
+  "quitHotkey": "Control+Alt+Q",
+  "width": 940,
+  "height": 760,
+  "alwaysOnTop": true,
+  "hideOnBlur": false,
+  "hideOnEscape": true,
+  "frame": true,
+  "zoomFactor": 1.0,
+  "tray": true,
+  "startHidden": true,
+  "useHiddenOwner": true,
+  "dataDir": "local"
+}
