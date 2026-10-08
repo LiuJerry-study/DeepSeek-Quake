@@ -162,7 +162,7 @@ namespace DeepSeekQuake
     internal static class Program
     {
         public const string Title = "DeepSeek Quake";
-        public const string Version = "2.1";
+        public const string Version = "2.5";
 
         // ── 全局状态 ───────────────────────────────────────────────
         public static Log Diag = new Log();
@@ -565,6 +565,137 @@ namespace DeepSeekQuake
             return 0;
         }
 
+        /// <summary>
+        /// --mousetest：验证 v2.5 修复的**两个层次**，从机制到产品代码：
+        ///   ① 机制：往输入流里补一条合成抬起，能不能把系统层面的假按下状态抹掉；
+        ///   ② 真实函数：把状态重新弄脏、**放开捕获**（模拟用户 v2.4 日志里 `cap=0x0` 的
+        ///      现场），再调产品里那个 `BrowserHost.PumpStuckMouseButtons`，看它是否
+        ///      自己抢到捕获、注入、并回读确认清干净。
+        ///
+        /// 为什么必须先把假设本身测出来：v2.2 / v2.3 两轮都是「按假设改完 → 用户回
+        ///『改了跟没改一样』」。这一次先把机制和函数都单独跑通，再把结果交给用户。
+        ///
+        /// **安全性**：先把自己（本进程的隐藏窗口）设成捕获窗口，所以 down/up
+        /// 只会投给我们自己的窗口，桌面上任何程序都收不到点击、光标也不会动。
+        /// 取不到捕获就**直接放弃、绝不注入**（否则那一下会落到光标下的任意程序上）。
+        /// 不论成败，收尾都会再补三次抬起，最后回读状态确认干净。全程约 300ms。
+        /// </summary>
+        private static int RunMouseTest()
+        {
+            Console.WriteLine("========== DeepSeek Quake 鼠标状态探针 v" + Version + " ==========");
+            Console.WriteLine("目的: 验证「注入合成抬起能清掉系统层面的假按下状态」，并跑一遍真实修复函数");
+            Console.WriteLine();
+
+            Form holder = new Form();
+            holder.ShowInTaskbar = false;
+            holder.FormBorderStyle = FormBorderStyle.None;
+            holder.StartPosition = FormStartPosition.Manual;
+            holder.Location = new Point(-4000, -4000);
+            holder.Size = new Size(1, 1);
+            IntPtr hwnd = holder.Handle;                 // 强制建句柄（窗口始终不显示）
+
+            int up = Marshal.SizeOf(typeof(Native.INPUT));
+            int send = 0;
+            bool realOk = false;
+
+            // 收尾统一走这里：宁可多发几次抬起，也绝不把「按着」留在系统里。
+            Action normalize = delegate
+            {
+                try
+                {
+                    for (int i = 0; i < 3; i++)
+                    {
+                        Native.SendInput(1, new Native.INPUT[]
+                            { Native.MakeMouseInput(Native.MOUSEEVENTF_RIGHTUP) }, up);
+                        Thread.Sleep(20);
+                    }
+                }
+                catch { }
+            };
+
+            try
+            {
+                Console.WriteLine("起始状态: " + Native.AsyncMouseButtons()
+                    + "   钩子记账: " + Native.SharedMouseButtons());
+
+                Native.SetCapture(hwnd);
+                bool captured = Native.GetCapture() == hwnd;
+                Console.WriteLine("把自己设为捕获窗口: " + (captured ? "成功" : "失败")
+                    + "（成功 = 下面的 down/up 只会投给我们自己，桌面收不到）");
+                if (!captured)
+                {
+                    Console.WriteLine();
+                    Console.WriteLine("结论: SKIP 取不到捕获，为安全起见不做注入。");
+                    return 2;
+                }
+
+                // 归一化：如果本来就有假按下（用户之前右键粘贴留下的），先清掉，
+                // 否则第 ① 步的观测没有意义。
+                if (Native.AsyncAnyButtonStuck())
+                {
+                    Console.WriteLine("（起始就有键卡在按下 → 先归一化）");
+                    normalize();
+                    Console.WriteLine("归一化后: " + Native.AsyncMouseButtons());
+                }
+
+                // ── 第一阶段：机制 ────────────────────────────────────
+                // ① 注入「按下」：制造出与「抬起被吞掉」等价的状态。
+                send = (int)Native.SendInput(1, new Native.INPUT[]
+                    { Native.MakeMouseInput(Native.MOUSEEVENTF_RIGHTDOWN) }, up);
+                Thread.Sleep(50);
+                bool down = Native.AsyncButtonStuck(Native.VK_RBUTTON);
+                Console.WriteLine("① 注入右键按下 → " + Native.AsyncMouseButtons()
+                    + (down ? "   [OK] 系统进入「按着」状态（= 抬起被吞掉后的等价状态）"
+                            : "   [失败] 系统没进入「按着」状态——注入没生效，常量或 SendInput 有问题"));
+
+                // ② 注入「抬起」：这一步就是 v2.5 的修法。
+                send = (int)Native.SendInput(1, new Native.INPUT[]
+                    { Native.MakeMouseInput(Native.MOUSEEVENTF_RIGHTUP) }, up);
+                Thread.Sleep(50);
+                bool cleared = !Native.AsyncButtonStuck(Native.VK_RBUTTON);
+                Console.WriteLine("② 注入右键抬起 → " + Native.AsyncMouseButtons()
+                    + (cleared ? "   [OK] 假按下状态被清掉 —— v2.5 的修法成立"
+                               : "   [失败] 没清掉 —— 得换修法"));
+
+                // ── 第二阶段：跑产品里那个真实的修复函数 ──────────────
+                // 关键字眼：这一步**放开捕获**再调它，还原用户日志里的现场
+                // （没有人攥着捕获，cap=0x0），看它能否自己解决。
+                Console.WriteLine();
+                Console.WriteLine("---- 第二阶段：调用产品里真实的 BrowserHost.PumpStuckMouseButtons ----");
+                Native.SendInput(1, new Native.INPUT[]
+                    { Native.MakeMouseInput(Native.MOUSEEVENTF_RIGHTDOWN) }, up);
+                Thread.Sleep(50);
+                try { Native.ReleaseCapture(); } catch { }
+                Console.WriteLine("重新弄脏后放开捕获: " + Native.AsyncMouseButtons()
+                    + "（钩子记账 " + Native.SharedMouseButtons()
+                    + "  我们持有捕获=" + (Native.GetCapture() == hwnd) + "）");
+
+                BrowserHost probe = new BrowserHost(new Log(), null);
+                probe.SetCaptureHost(delegate { return hwnd; });
+                bool fnSaysOk = probe.PumpStuckMouseButtons("自检");
+                bool cleanNow = !Native.AsyncAnyButtonStuck();
+                realOk = fnSaysOk && cleanNow;
+                Console.WriteLine("函数返回=" + fnSaysOk + "  修完状态=" + Native.AsyncMouseButtons()
+                    + (realOk ? "   [OK] 真实修复函数自己抢捕获、注入、回读确认，全部走通"
+                              : "   [失败] 真实函数没能清掉"));
+                Console.WriteLine("它自己记录的结论: " + (probe.LastPumpResult ?? "（空）"));
+            }
+            finally
+            {
+                normalize();
+                try { Native.ReleaseCapture(); } catch { }
+                try { if (Native.GetCapture() == hwnd) Native.ReleaseCapture(); } catch { }
+                Console.WriteLine();
+                Console.WriteLine("最终状态: " + Native.AsyncMouseButtons() + "   （必须是 R- 才算干净）");
+                bool allOk = send == 1 && realOk && !Native.AsyncAnyButtonStuck();
+                Console.WriteLine("结论: " + (allOk
+                    ? "PASS 机制成立，且产品里真实的修复函数走通"
+                    : "FAIL 见上面的具体步骤"));
+                try { holder.Dispose(); } catch { }
+            }
+            return (!Native.AsyncAnyButtonStuck()) ? 0 : 1;
+        }
+
         [STAThread]
         private static void Main(string[] args)
         {
@@ -589,6 +720,15 @@ namespace DeepSeekQuake
                 if (a != null && a.StartsWith("--hookprobe", StringComparison.OrdinalIgnoreCase))
                 {
                     Environment.ExitCode = RunHookProbe();
+                    return;
+                }
+
+            // --mousetest：验证「注入合成抬起能清掉假按下状态」（v2.5 修法的核心假设）。
+            // 只在排查时手动跑；它会短暂地在自己身上注入一按一抬，桌面上看不到任何影响。
+            foreach (string a in args)
+                if (a != null && a.StartsWith("--mousetest", StringComparison.OrdinalIgnoreCase))
+                {
+                    Environment.ExitCode = RunMouseTest();
                     return;
                 }
 
@@ -704,6 +844,9 @@ namespace DeepSeekQuake
             _msg = new MessageWindow(_hotkeys, PasteClipboard);
             IntPtr dummy = _msg.Handle;                       // 强制建句柄，供 RegisterHotKey 用
             _hotkeys.AttachWindow(dummy);
+            // 清鼠标捕获时需要用「本线程（UI 线程）自己的窗口」去抢一次捕获——
+            // SetCapture 只接受调用线程创建的窗口，理由见 BrowserHost.StealCapture。
+            _host.SetCaptureHost(delegate { return _msg.Handle; });
 
             if (_host.Browser == null)
             {
@@ -985,6 +1128,9 @@ namespace DeepSeekQuake
             {
                 _host.EnsureToolWindow(_host.TargetWindow);
                 _host.VerifyHideLanded();          // 上一拍收起没落地就补一次
+                _host.CaptureWatchdog();           // 已收起的窗口若还攥着鼠标捕获，立刻清掉
+                _host.PumpWatchdog();              // 右键粘贴留下的「假按下」状态到点就修掉
+                _host.FinishClickProbe();          // 给收起后那第一下左键补上「点击后前台」并留证
                 // 热键之前没启用成功就再试（例如占用它的程序退出了）。
                 // 条件必须是「有失败原因」——_hotkeyProblem 只有在失败时才非空，
                 // 成功时是 null。旧版这里写反了，所以这条重试永远不会发生。
@@ -1096,6 +1242,44 @@ namespace DeepSeekQuake
                     // cap：目标线程当前持有的鼠标捕获窗口。非 0 表示「有一个隐藏的窗口
                     // 正在偷走全桌面的点击」——用户症状二（别的页面点不动）的指纹。
                     + " cap=0x" + _host.TargetThreadCapture.ToInt64().ToString("X")
+                    // capfix：累计清掉的残留捕获次数。>0 说明确实发生过「隐藏窗口攥着捕获」
+                    // （用户症状：收起后别的窗口左键点不动），而且已经被清掉了。
+                    + " capfix=" + _host.CaptureFixCount
+                    // fsteal：累计「强制夺回」次数（v2.3 新增）。收起路径不再只信检测，
+                    // 每次都夺一次；这个数随每次收起增长属于正常。
+                    + " fsteal=" + _host.ForcedStealCount
+                    // gterr：GetGUIThreadInfo 失败次数（v2.3 新增）。**>0 就说明捕获检测有
+                    // 盲区**——cap=0x0 不能证明「真的没有捕获」，只可能是查不到。
+                    + " gterr=" + _host.GtiQueryFailures
+                    // owncap：我们自己的 UI 线程持有的捕获（v2.3 新增）。正常永远是 0；
+                    // 非 0 意味着是我们**自己**变成了那个「隐藏的捕获持有者」。
+                    + " owncap=0x" + _host.OwnThreadCapture.ToInt64().ToString("X")
+                    // clip：光标有没有被 ClipCursor 困在一个比虚拟屏幕更小的矩形里
+                    // （v2.3 新增）。这是与鼠标捕获并列的第二种「全桌面点不动」机制。
+                    + " clip=" + (_host.CursorClipped ? "1" : "0")
+                    // gtiflg / gtimen：目标线程的模态状态（v2.3 新增）。菜单模态循环会
+                    // **自己**吃掉点击，症状与捕获残留一模一样但机制不同：gtimen 非 0
+                    // 或 gtiflg 带 0x4/0x8/0x10 就说明是菜单在吃点击，不是捕获。
+                    + " gtiflg=0x" + _host.TargetThreadFlags.ToString("X")
+                    + " gtimen=0x" + _host.TargetMenuOwner.ToInt64().ToString("X")
+                    // stealfrom：夺回时「原来持有捕获的窗口」（v2.3 新增）。**非 0 就是真凶**——
+                    // SetCapture 的返回值是上一个捕获窗口，这是全系统唯一能问到「谁攥着捕获」
+                    // 的办法。它非 0 而 cap=0x0，就说明检测确实存在盲区。
+                    + " stealfrom=0x" + _host.LastStealFrom.ToInt64().ToString("X")
+                    // stealn：真正调用过 SetCapture 的次数 / 其中夺到的次数。
+                    + " stealn=" + _host.StealAttempts + "/" + _host.StealGotCount
+                    // probe：收起后左键探针观察到的点击次数（详情见事件日志）
+                    + " probe=" + _host.ProbeClicks
+                    // btn：系统层面的鼠标按键状态（v2.4 新增）。`R!` = 系统认为右键仍按着
+                    // ——右键粘贴吞掉抬起后的残留，且**不产生显式捕获**（cap 照样 0x0）。
+                    // 后面 /sh 是钩子看到的真实物理状态，两者不一致就说明状态已中毒。
+                    + " btn=" + Native.AsyncMouseButtons() + "/sh" + Native.SharedMouseButtons()
+                    // pumps：注入合成抬起（修「假按下」状态）的累计次数（v2.5 新增）。
+                    // **它 >0 就说明确实发生过状态中毒**，而且已经修过了；配合 plum 看结果。
+                    + " pumps=" + _host.ButtonPumpCount
+                    // plum：最近一次合成抬起的「注入前→注入后」与原因（v2.5 新增）。
+                    // 期望看到 `R!→R-`；若注入后仍是 `R!`，说明这条 up 没进输入流。
+                    + " plum=[" + (_host.LastPumpResult ?? "") + "]"
                     // rmb：右键抬起被吞掉的累计次数。这是「右键之后双击 Ctrl 收不回去」
                     // 那条链路的关键计数——被吞一次就会让鼠标状态中毒，必须由
                     // NoteRmbUpSwallowed 主动更正（见 Native 里的说明）。
@@ -1103,6 +1287,13 @@ namespace DeepSeekQuake
                     + " tm=" + _toggleMessages + " hb=" + _uiHeartbeat + " slow=" + _slowTickCount
                     + " d=" + Stats.Down + " u=" + Stats.Up + " p=" + Stats.Paste
                     + " fgr=" + (_host.LastForegroundResult ?? "")
+                    // fgw：此刻前台窗口的指纹 —— 句柄 / 可见(v) / 是不是我们的目标窗口(m)。
+                    // 「收起后点别的窗口没反应」时先看这三个：v0 说明前台悬在一个已经藏起来的
+                    // 窗口上（桌面上等于没有前台，第一下点击只会被拿去指定前台）；
+                    // m1 说明前台还指着我们那个已经收起的窗口。
+                    + " fgw=0x" + fg.ToInt64().ToString("X")
+                    + "/v" + (fg == IntPtr.Zero ? 0 : (Native.IsWindowVisible(fg) ? 1 : 0))
+                    + "/m" + (_host.IsOurs(fg) ? 1 : 0)
                     + " pid=" + Process.GetCurrentProcess().Id;
                 Native.SetWindowTextSafe(_traceHwnd, _traceText);
             }
@@ -1498,6 +1689,13 @@ namespace DeepSeekQuake
         private static void PasteClipboard()
         {
             Stats.NotePaste();
+            // ★ 右键抬起刚被钩子吞掉，系统层面的 VK_RBUTTON 此刻已经**假按下**了。
+            //    安排一次延迟修复（v2.5）：等浏览器把这次右键处理完，就注入一条合成抬起
+            //    把那个假状态抹掉——否则之后点别的窗口不会有任何反应（前台不切换）。
+            //    必须在 UI 线程发起：修复前要先用捕获把这条 up 重定向给自己（SetCapture
+            //    只接受调用线程创建的窗口）。这里正是 UI 线程（WM_APP_PASTE 的处理入口）。
+            try { if (_host != null) _host.RequestButtonPump("右键粘贴后", 300); }
+            catch { }
             // 右键抬起刚过去，给页面一点点时间把焦点/光标放到点击位置，再注入 Ctrl+V，
             // 否则偶发会粘到旧焦点上。
             ThreadPool.QueueUserWorkItem(delegate(object s)

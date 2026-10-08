@@ -130,6 +130,89 @@ namespace DeepSeekQuake
         [DllImport("user32.dll")]
         public static extern short GetAsyncKeyState(int vKey);
 
+        // ── 鼠标捕获（清残留用）────────────────────────────────────
+        //
+        // 背景：右键粘贴为了不让 Chrome 弹原生菜单，会吞掉 WM_RBUTTONUP。浏览器因此
+        // 认为「右键还按着」，把鼠标捕获攥在手里不放；而**一个持有捕获的窗口即使被
+        // 隐藏，仍然会继续收到鼠标消息**（实测 win32probe\out\p5_rbutton.txt 场景 C），
+        // 用户看到的就是「收起之后，别的窗口左键点不动；再点一下右键才恢复」。
+        //
+        // 正规解法是给对方补发 WM_CANCELMODE —— DefWindowProc 收到它就会 ReleaseCapture。
+        // 但对方是**别的进程**，它完全可以不处理这条消息（浏览器就这么干过）。所以再留一手：
+        // 系统同一时刻只允许一个窗口持有捕获，于是我们把自己线程里的一个窗口设成捕获窗口，
+        // 原持有者就会立刻被系统通知 WM_CAPTURECHANGED 而放手；我们随即 ReleaseCapture，
+        // 不留任何副作用。这一手完全不依赖对方配合，也不会弹出 Chrome 的原生右键菜单。
+        //
+        // 注意 GetCapture 只回答「本线程有没有持有捕获」，所以它只用来**确认我们自己**
+        // 有没有夺到，不能用来读别人持有的捕获——读对方要用 GetGUIThreadInfo（见 BrowserHost）。
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetCapture();
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr SetCapture(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern bool ReleaseCapture();
+
+        /// <summary>
+        /// 读当前的**光标裁剪区**（ClipCursor）。光标的裁剪是全局状态，不属于某个窗口：
+        /// 一旦有程序调了 ClipCursor 却没恢复（典型的如拖拽、模态循环、DPR 切换），
+        /// 光标就会被永久困在一个小矩形里——用户描述同样会是「鼠标像被锁住、点不动别的
+        /// 窗口」。这是与鼠标捕获并列的、第二种能造成「全桌面点不动」的机制，所以
+        /// 2026-10-08 排查「右键之后点不动」时把它一并纳入诊断。
+        ///
+        /// 判据：返回的矩形等于整个虚拟屏幕时 = 没有裁剪（正常）。
+        /// </summary>
+        [DllImport("user32.dll")]
+        public static extern bool GetClipCursor(out RECT lpRect);
+
+        [DllImport("user32.dll")]
+        public static extern int GetSystemMetrics(int index);
+
+        /// <summary>虚拟屏幕（所有显示器合并）的边界，用来判断光标有没有被裁剪。</summary>
+        public static RECT VirtualScreenRect()
+        {
+            RECT r;
+            r.Left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            r.Top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            r.Right = r.Left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            r.Bottom = r.Top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            return r;
+        }
+
+        public const int SM_XVIRTUALSCREEN = 76;
+        public const int SM_YVIRTUALSCREEN = 77;
+        public const int SM_CXVIRTUALSCREEN = 78;
+        public const int SM_CYVIRTUALSCREEN = 79;
+
+        /// <summary>取光标当前位置（屏幕坐标）。</summary>
+        [DllImport("user32.dll")]
+        public static extern bool GetCursorPos(out POINT p);
+
+        /// <summary>
+        /// 取屏幕某点下方**最靠上的可见窗口**。注意：这个函数**不看鼠标捕获**——
+        /// 即使某个隐藏窗口正攥着捕获（那时候点击会被送给它），这里返回的仍然是
+        /// 眼睛看到的那个窗口。所以它能用来回答「你以为点到的是谁」，
+        /// 要回答「点击实际送给了谁」必须另外看前台有没有变化（见 BrowserHost 的左键探针）。
+        /// </summary>
+        [DllImport("user32.dll")]
+        public static extern IntPtr WindowFromPoint(POINT p);
+
+        /// <summary>把一个点描述成「句柄[类名]」的可读形式，诊断用。</summary>
+        public static string DescribeAt(POINT p)
+        {
+            try
+            {
+                IntPtr h = WindowFromPoint(p);
+                if (h == IntPtr.Zero) return "0x0";
+                uint pid;
+                GetWindowThreadProcessId(h, out pid);
+                return "0x" + h.ToInt64().ToString("X")
+                    + "[" + ClassOf(h) + "/pid=" + pid + "]";
+            }
+            catch { return "?"; }
+        }
+
         [DllImport("user32.dll")]
         public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter,
             int x, int y, int cx, int cy, uint flags);
@@ -243,6 +326,13 @@ namespace DeepSeekQuake
             public IntPtr hwndCaret;
             public RECT rcCaret;
         }
+
+        // GUITHREADINFO.flags 里与「点了没反应」直接相关的三位：
+        // 线程一旦进入菜单模态循环，鼠标点击会被那个循环吃掉（既不是捕获、也不是前台问题），
+        // 所以诊断时必须把 flags 和 hwndMenuOwner 一起读出来，才能和「捕获残留」区分开。
+        public const uint GUI_INMENUMODE = 0x00000004;
+        public const uint GUI_SYSTEMMENUMODE = 0x00000008;
+        public const uint GUI_POPUPMENUMODE = 0x00000010;
 
         [StructLayout(LayoutKind.Sequential)]
         public struct POINT { public int x; public int y; }
@@ -420,6 +510,19 @@ namespace DeepSeekQuake
 
         public const uint KEYEVENTF_KEYUP = 0x0002;
         public const uint INPUT_KEYBOARD = 1;
+        public const uint INPUT_MOUSE = 0;
+
+        // SendInput 的鼠标事件标志。
+        //
+        // ⚠️ 本工具**只**注入「抬起」（*UP），**绝不注入「按下」**——注入按下等于凭空
+        // 按一下用户的鼠标，会把用户正在做的拖拽/点击搅乱。唯一用到这些常量的是
+        // BrowserHost.PumpStuckMouseButtons：把「被吞掉抬起」留在系统里的假按下状态抹掉。
+        public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+        public const uint MOUSEEVENTF_LEFTUP = 0x0004;
+        public const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
+        public const uint MOUSEEVENTF_RIGHTUP = 0x0010;
+        public const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
+        public const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
 
         /// <summary>
         /// 本工具自己注入按键时写在 dwExtraInfo 上的标记。低级键盘钩子看到这个标记就
@@ -556,6 +659,87 @@ namespace DeepSeekQuake
         }
 
         public static int SwallowedRmbUps { get { return _swallowedRmbUp; } }
+
+        /// <summary>
+        /// 鼠标按键在**系统层面**的异步状态原始值（`GetAsyncKeyState` 的 0x8000 位），诊断用。
+        /// 形如 `L-/R!/M-`，`!` = 系统认为该键正按着。
+        ///
+        /// ⚠️ **右键粘贴吞掉 WM_RBUTTONUP 之后，R 会一直显示 `!`** —— 用户早就松手了，
+        /// 但那次抬起从未进入输入队列，所以系统状态永远停在「按着」。
+        /// 2026-10-08 排查「收起后别的窗口点不动」时把它加进诊断：
+        /// 它是**唯一不依赖显式捕获**就能让鼠标行为失真的机制，而那条路径下
+        /// `cap=` 始终是 0x0——四项常规诊断全阴性、问题却依旧，这是最可能的解释。
+        /// </summary>
+        public static string AsyncMouseButtons()
+        {
+            try
+            {
+                return "L" + ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 ? "!" : "-")
+                    + "/R" + ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 ? "!" : "-")
+                    + "/M" + ((GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0 ? "!" : "-");
+            }
+            catch { return "?"; }
+        }
+
+        /// <summary>共享记账（钩子看到的真实物理状态）——与 AsyncMouseButtons 对照看才准。</summary>
+        public static string SharedMouseButtons()
+        {
+            return "L" + (_mouseL ? "!" : "-") + "/R" + (_mouseR ? "!" : "-")
+                + "/M" + (_mouseM ? "!" : "-");
+        }
+
+        /// <summary>系统层面是否有按键「被卡在按下状态」（含被吞抬起的右键）。</summary>
+        public static bool AsyncAnyButtonStuck()
+        {
+            try
+            {
+                return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0
+                    || (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0
+                    || (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// 单颗鼠标键此刻在**系统层面**是否卡在按下（`GetAsyncKeyState` 的 0x8000 位）。
+        /// 与 <see cref="SharedButtonDown"/> 对照使用：那个是「钩子看到的真实物理状态」，
+        /// 这个是「系统以为的状态」。**两者不一致 = 状态已经中毒**，唯一的修法就是
+        /// 注入一次合成抬起（见 BrowserHost.PumpStuckMouseButtons）。
+        /// </summary>
+        public static bool AsyncButtonStuck(int vk)
+        {
+            try { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// 共享记账里这颗键的**真实物理状态**（低级钩子看到的那一份）。
+        /// 按下事件我们从不吞，所以它对「用户此刻是不是真按着」是可信的。
+        /// </summary>
+        public static bool SharedButtonDown(int vk)
+        {
+            if (vk == VK_LBUTTON) return _mouseL;
+            if (vk == VK_RBUTTON) return _mouseR;
+            if (vk == VK_MBUTTON) return _mouseM;
+            return false;
+        }
+
+        /// <summary>
+        /// 造一条鼠标输入。**只给「抬起」用**（理由见 MOUSEEVENTF_* 常量处的说明）。
+        /// 带 <see cref="DSQ_EXTRAINFO"/> 标记，好让我们自己的钩子一眼认出它是自己注入的。
+        /// </summary>
+        public static INPUT MakeMouseInput(uint flags)
+        {
+            INPUT input = new INPUT();
+            input.type = INPUT_MOUSE;
+            input.u.mi.dx = 0;
+            input.u.mi.dy = 0;
+            input.u.mi.mouseData = 0;
+            input.u.mi.dwFlags = flags;
+            input.u.mi.time = 0;
+            input.u.mi.dwExtraInfo = DSQ_EXTRAINFO;
+            return input;
+        }
 
         /// <summary>把共享鼠标按键状态清干净（切换热键 / 卸载钩子时调用，避免陈旧状态）。</summary>
         public static void ResetMouseButtonState()

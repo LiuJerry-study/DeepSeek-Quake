@@ -162,7 +162,34 @@ namespace DeepSeekQuake
                 sb.AppendLine("    可见=" + host.Visible + "   前台是我们=" + host.IsOursForeground());
                 IntPtr cap = host.TargetThreadCapture;
                 sb.AppendLine("    浏览器线程 capture=0x" + cap.ToInt64().ToString("X")
-                    + (cap == IntPtr.Zero ? "（正常）" : "（残留，隐藏时不会截输入；再次粘贴/收起会尝试清掉）"));
+                    + (cap == IntPtr.Zero
+                        ? "（未检测到捕获；注意查询失败时同样显示 0——看下面 gterr）"
+                        : "（残留！隐藏的捕获持有者会把全桌面点击都抢走，这正是「收起后点不动」的元凶）"));
+                sb.AppendLine("    浏览器线程 模态 flags=0x" + host.TargetThreadFlags.ToString("X")
+                    + "  菜单宿主 hwndMenuOwner=0x" + host.TargetMenuOwner.ToInt64().ToString("X")
+                    + (host.TargetInMenuMode ? "  ← 菜单模态循环正在吃点击（机制与捕获残留不同）" : ""));
+                sb.AppendLine("    光标被裁剪(ClipCursor)=" + host.CursorClipped
+                    + (host.CursorClipped ? "  ← 光标被困在小矩形里，同样会「点不动别的窗口」" : "（正常）"));
+                sb.AppendLine("    捕获检测失败 gterr=" + host.GtiQueryFailures
+                    + (host.GtiQueryFailures > 0 ? "  ← >0 说明检测有盲区，cap=0x0 不能当作「没有捕获」" : "（正常）"));
+                sb.AppendLine("    强制夺回次数 fsteal=" + host.ForcedStealCount + "（收起后每次都夺一次，属正常）");
+                sb.AppendLine("    夺回采样 stealn=" + host.StealAttempts + " 次调用 / " + host.StealGotCount + " 次夺到"
+                    + "  stealfrom=0x" + host.LastStealFrom.ToInt64().ToString("X")
+                    + (host.LastStealFrom != IntPtr.Zero
+                        ? "  ← 非 0！这就是刚才攥着鼠标捕获的那个窗口（真凶指纹）"
+                        : ""));
+                sb.AppendLine("    收起后左键探针 probe=" + host.ProbeClicks + " 次点击"
+                    + (string.IsNullOrEmpty(host.ProbeLast) ? "" : "；最近一次：" + host.ProbeLast));
+                sb.AppendLine("    系统鼠标按键状态 btn=" + Native.AsyncMouseButtons()
+                    + "（钩子看到的真实状态 " + Native.SharedMouseButtons() + "）"
+                    + (Native.AsyncAnyButtonStuck()
+                        ? "  ← 有键卡在「按下」！这就是右键抬起被吞掉的后遗症："
+                          + "它不产生任何显式捕获，却能让后续鼠标行为失真（收起后点别的窗口没反应）"
+                        : "（正常）"));
+                sb.AppendLine("    注入合成抬起 pumps=" + host.ButtonPumpCount
+                    + " 次（v2.5 的修复：把上面那个「假按下」状态抹掉）");
+                if (!string.IsNullOrEmpty(host.LastPumpResult))
+                    sb.AppendLine("    最近一次: " + host.LastPumpResult);
                 IntPtr fgNow = Native.GetForegroundWindow();
                 sb.AppendLine("    当前前台 hwnd=0x" + fgNow.ToInt64().ToString("X")
                     + "  可见=" + Native.IsWindowVisible(fgNow));

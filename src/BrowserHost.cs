@@ -69,11 +69,171 @@ namespace DeepSeekQuake
         private Native.LowLevelProc _mouseProc;
         private bool _armed;
 
+        // 清残留鼠标捕获：SetCapture 只接受**调用线程自己创建的窗口**，所以需要一个
+        // 属于 UI 线程的窗口句柄（Program 在消息窗口建好后注入），以及记住哪个线程是
+        // UI 线程——从别的线程（例如右键粘贴那条线程池线程）来的时候只能走温和手段。
+        private Func<IntPtr> _captureHost;
+        private readonly uint _uiThreadId;
+        private int _captureFixes;                    // 累计清掉的残留捕获次数（诊断用）
+        private int _lastCaptureSweepTick;            // 心跳清扫的节流时刻
+        private int _forcedSteals;                    // 累计「强制夺回」次数（诊断用，见 fsteal=）
+        private int _gtiFailures;                     // GetGUIThreadInfo 失败次数（= 捕获检测盲区）
+        private int _lastHideTick;                    // 最近一次收起完成的时刻（敏感期节流用）
+        private int _stealAttempts;                   // 真正调用过 SetCapture 的次数
+        private int _stealGot;                        // 其中确实夺到捕获的次数
+        private IntPtr _lastStealFrom = IntPtr.Zero;  // 夺回时「原来持有捕获的窗口」——真凶指纹
+
+        // ── 「把被吞掉的抬起留在系统里的假按下状态修回来」────────────────
+        // v2.4 的取证定案：右键粘贴吞掉 WM_RBUTTONUP 之后，GetAsyncKeyState(VK_RBUTTON)
+        // 的 0x8000 位会**一直挂着**（日志里的 btn=L-/R!/M- 对 shL-/R-/M-：系统认为
+        // 右键还按着，而钩子看到的真实状态是已松开）。它不产生任何显式捕获，
+        // 所以 cap/stealfrom 全是 0——这也是前两轮修错方向的原因。
+        private int _buttonPumps;                     // 累计注入合成抬起的次数（诊断串 pumps=）
+        private string _lastPumpResult = "";          // 最近一次注入的前后状态（诊断串 plum=）
+        private int _lastPumpTick;                    // 节流：同一次卡住别反复注入
+        private int _pumpDueTick;                     // 延迟请求：到点后由心跳执行
+        private int _pumpRetries;                     // 用户正按着鼠标时的让路计数（有上限）
+        private string _pumpWhy = "";
+
+        // ── 收起后的「左键探针」 ──────────────────────────────────
+        // 为什么需要它：用户报「收起后点别的窗口没反应」，而 2026-10-08 v2.3 那份日志里
+        // 捕获、光标裁剪、菜单模态、前台悬空**四项诊断全是阴性**（cap/owncap/clip/gtiflg/
+        // gtimen 全 0，gterr=0，fsteal=26 却夺不到任何东西）。
+        // 常规机制既然都排除了，就必须**直接观察那一下点击本身**：
+        //   点在哪 → 眼睛看到的是哪个窗口 → 点击前谁在前台 → 点击后前台有没有变。
+        // 只观测、绝不吞消息（永远 CallNextHookEx）。
+        private IntPtr _probeHook = IntPtr.Zero;
+        private Native.LowLevelProc _probeProc;
+        private int _probeUntilTick;
+        private int _probeClicks;
+        private IntPtr _probeFgBefore = IntPtr.Zero;
+        private string _probeAwait = null;            // 首次点击的记录，等下一拍补「点击后前台」
+        private string _probeLast = "";               // 最近一次探针结论
+
         // 前台变化通知
         private IntPtr _winEventHook = IntPtr.Zero;
         private Native.WinEventProc _winEventProc;
 
-        public BrowserHost(Log log, HookStats stats) { _log = log; _stats = stats; }
+        public BrowserHost(Log log, HookStats stats)
+        {
+            _log = log;
+            _stats = stats;
+            // 这个对象是在 UI 线程上构造的，记下来：清捕获时要判断能不能用「夺回」那一手。
+            _uiThreadId = Native.GetCurrentThreadId();
+        }
+
+        /// <summary>注入「本线程（UI 线程）里某个窗口」的句柄提供者，用于强制夺回鼠标捕获。</summary>
+        public void SetCaptureHost(Func<IntPtr> provider) { _captureHost = provider; }
+
+        /// <summary>累计清掉的残留鼠标捕获次数。诊断串里的 `capfix=`。</summary>
+        public int CaptureFixCount { get { return _captureFixes; } }
+
+        /// <summary>累计「强制夺回」次数。诊断串里的 `fsteal=`。</summary>
+        public int ForcedStealCount { get { return _forcedSteals; } }
+
+        /// <summary>真正调用过 SetCapture 的次数（诊断串 `stealn=`）。</summary>
+        public int StealAttempts { get { return _stealAttempts; } }
+
+        /// <summary>确实夺到捕获的次数（诊断串 `stealok=`）。</summary>
+        public int StealGotCount { get { return _stealGot; } }
+
+        /// <summary>
+        /// 最近一次夺回时「原来持有捕获的窗口」。**非 0 就是真凶的指纹。**
+        /// `SetCapture` 的返回值正是上一个捕获窗口——这是全系统唯一能问到
+        /// 「究竟是谁攥着捕获」的办法（`GetCapture` 只答本线程，
+        /// `GetGUIThreadInfo` 只答指定线程），所以绝不能丢掉。
+        /// </summary>
+        public IntPtr LastStealFrom { get { return _lastStealFrom; } }
+
+        /// <summary>收起后的左键探针观察到的点击次数（诊断串 `probe=`）。</summary>
+        public int ProbeClicks { get { return _probeClicks; } }
+
+        /// <summary>累计注入合成抬起的次数（诊断串 `pumps=`）。>0 说明确实发生过状态中毒。</summary>
+        public int ButtonPumpCount { get { return _buttonPumps; } }
+
+        /// <summary>最近一次合成抬起的「注入前 → 注入后」状态与原因（诊断串 `plum=`）。</summary>
+        public string LastPumpResult { get { return _lastPumpResult; } }
+
+        /// <summary>最近一次探针结论（进诊断串 `plas=`）。</summary>
+        public string ProbeLast { get { return _probeLast; } }
+
+        /// <summary>
+        /// `GetGUIThreadInfo` 失败的累计次数。诊断串里的 `gterr=`。
+        ///
+        /// **这个数字 > 0 就说明「捕获检测存在盲区」**：`CaptureWindowOf` 在查询失败时
+        /// 返回 0，和「确实没有捕获」无法区分；而所有只靠检测的防线（`ForceDropCapture`
+        /// 的早退、`CaptureWatchdog` 的前置判断）都会因此静默失效。清不掉捕获时
+        /// 用户看到的就是「收起后别的窗口左键点不动」。所以必须靠「强制夺回」兜底。
+        /// </summary>
+        public int GtiQueryFailures { get { return _gtiFailures; } }
+
+        /// <summary>
+        /// 我们的 UI 线程自己此刻有没有持有鼠标捕获。**只在 UI 线程上读才有意义**
+        /// （GetCapture 只回答「本线程」，见 Native 里的说明），诊断串是在 UI 心跳里拼的。
+        /// 正常永远是 0——如果不是 0，那就是我们**自己**变成了那个「隐藏的捕获持有者」。
+        /// </summary>
+        public IntPtr OwnThreadCapture
+        {
+            get
+            {
+                try { return Native.GetCapture(); } catch { return IntPtr.Zero; }
+            }
+        }
+
+        /// <summary>
+        /// 光标有没有被裁剪成比整个虚拟屏幕更小的矩形。
+        /// true = 桌面上存在一个「光标陷阱」，用户同样是「鼠标像被锁住、点不到别的窗口」，
+        /// 但机制与鼠标捕获无关（见 Native.GetClipCursor）。
+        /// </summary>
+        public bool CursorClipped
+        {
+            get
+            {
+                try
+                {
+                    Native.RECT clip;
+                    if (!Native.GetClipCursor(out clip)) return false;
+                    Native.RECT v = Native.VirtualScreenRect();
+                    return clip.Left > v.Left || clip.Top > v.Top
+                        || clip.Right < v.Right || clip.Bottom < v.Bottom;
+                }
+                catch { return false; }
+            }
+        }
+
+        /// <summary>目标窗口所在线程的 GUITHREADINFO.flags（查不到返回 0）。</summary>
+        public uint TargetThreadFlags
+        {
+            get
+            {
+                Native.GUITHREADINFO gti;
+                return TryGetThreadInfo(_hwnd, out gti) ? gti.flags : 0u;
+            }
+        }
+
+        /// <summary>目标窗口所在线程当前的菜单宿主窗口。正常为 0。</summary>
+        public IntPtr TargetMenuOwner
+        {
+            get
+            {
+                Native.GUITHREADINFO gti;
+                return TryGetThreadInfo(_hwnd, out gti) ? gti.hwndMenuOwner : IntPtr.Zero;
+            }
+        }
+
+        /// <summary>
+        /// 目标线程是不是正处在**菜单模态循环**里。这种状态下点击会被那个循环吃掉
+        /// ——症状与「捕获残留」一模一样，但机制不同，所以诊断必须能把两者分开。
+        /// </summary>
+        public bool TargetInMenuMode
+        {
+            get
+            {
+                uint any = Native.GUI_INMENUMODE | Native.GUI_SYSTEMMENUMODE
+                    | Native.GUI_POPUPMENUMODE;
+                return (TargetThreadFlags & any) != 0;
+            }
+        }
 
         public IntPtr TargetWindow { get { return _hwnd; } }
         public uint LaunchedPid { get { return _launchedPid; } }
@@ -804,6 +964,7 @@ namespace DeepSeekQuake
             if (!IsWindowAlive()) return;
 
             UninstallMouseHook();                       // 跨进程操作前先摘钩子
+            StopClickProbe();                           // 窗口要回来了，探针收工
             IntPtr fg = Native.GetForegroundWindow();
             if (fg != IntPtr.Zero && !IsOurs(fg)) _lastForeground = fg;
 
@@ -855,13 +1016,19 @@ namespace DeepSeekQuake
             bool hidden = SetVisibleCore(false);
 
             // 3) 前台必须交还给别的窗口并确认。交还失败时，第一下点击只会起激活作用。
-            //    核对只做 2 轮 × 30ms。
-            if (wasOurs && _restoreFocus)
+            //    核对做 3 轮 × 30ms（见 RestorePreviousForeground）。
+            //
+            //    除了「收起前它是前台」，还要覆盖一种更隐蔽的情况：**收起之后前台仍然
+            //    指着那个已经藏起来的窗口**。这时桌面上等于没有前台，用户之后的第一下
+            //    点击只会被用来「指定前台」而不生效——用户描述就是「收起后左键点别的
+            //    窗口没反应，像被锁住，得先点一下才恢复」。所以这里不再只看 wasOurs。
+            bool fgStillOurs = Native.GetForegroundWindow() == _hwnd;
+            if (_restoreFocus && (wasOurs || fgStillOurs))
             {
                 if (!RestorePreviousForeground())
                     _log.Add("收起：前台未确认交还（第一下点击可能只起激活作用）");
             }
-            else if (!_restoreFocus && Native.GetForegroundWindow() == _hwnd)
+            else if (!_restoreFocus && fgStillOurs)
             {
                 _log.Add("收起：前台仍指向已隐藏的窗口（restorefocus 关闭时无法自动交还）");
             }
@@ -870,9 +1037,45 @@ namespace DeepSeekQuake
             //    本机没有任务栏、没有 Alt+Tab，一个永久置顶的窗口会把桌面彻底挡死。
             EnsureNotTopmost();
 
-            // 5) 清掉可能残留的鼠标捕获。这一步直接决定「别的页面还能不能点」，
-            //    原因见 ReleaseLeakedCapture 的注释。
-            ReleaseLeakedCapture();
+            // 5) 清掉残留的鼠标捕获，**并且要求确认**。这一步直接决定「别的页面还能不能
+            //    点」：隐藏的捕获持有者会把之后所有点击都抢走，用户看到的就是「收起后
+            //    别的窗口左键点不动、非得再右键一下才恢复」。
+            //
+            //    ★ 这里必须 forceSteal。检测（CaptureWindowOf）本身有盲区：它靠
+            //    GetGUIThreadInfo，查询失败时同样返回 0，与「真的没有捕获」无法区分。
+            //    只信检测的话，盲区里整条防线会被静默跳过——2026-10-08 用户日志里
+            //    `capfix=2` 却依旧点不动，就是这个原因。强制夺回不需要检测成功，也不
+            //    需要对方配合（系统同一时刻只允许一个窗口持有捕获），成本约 0ms。
+            if (!ForceDropCapture("收起", true))
+                _log.Add("收起后仍有鼠标捕获没清掉——如果这时点别的窗口没反应，请把诊断串发给我");
+
+            // 记下收起时刻：心跳兜底在接下来 3 秒内会放宽节流，且同样不信检测
+            // （用户就是在这几秒里去点别的窗口的；浏览器也完全可能在这之后才重新拿到捕获）。
+            _lastHideTick = Environment.TickCount;
+
+            // ★ v2.5 根因修复（v2.4 的取证已定案）：把「右键粘贴吞掉 WM_RBUTTONUP」留下的
+            //    **假按下状态**修掉。右键粘贴吞掉的一次抬起从未进输入流，于是
+            //    GetAsyncKeyState(VK_RBUTTON) 的 0x8000 位**一直挂着**——用户早就松手，
+            //    系统却认为右键还按着（v2.4 日志：btn=R! 对 sh=R-）。它不产生任何显式捕获
+            //    （cap 照样 0x0），却让后续点击不再起激活作用（前台不切，fgw 变 0x0），
+            //    用户看到的就是「收起后左键像被锁住，非得再点一下右键才恢复」。
+            //
+            //    放在**收起之后**：此时窗口已藏起来，这条合成抬起无论投递给谁都触发不了
+            //    可见的原生菜单；而且我们会先抢捕获把它重定向给自己窗，双保险。
+            //    详见 PumpStuckMouseButtons 的完整推导。
+            if (!PumpStuckMouseButtons("收起") && Native.AsyncAnyButtonStuck()
+                && !Native.IsAnyMouseButtonPhysicallyDown())
+            {
+                // 到这里 = 系统仍认为有键按着，而钩子记账说它不是真按着 → 合成抬起没清掉。
+                // 把现场摆到台面上，绝不静默：这一条一旦出现，就说明还有别的机制。
+                _log.Add("注意：系统仍认为有鼠标键按着（" + Native.AsyncMouseButtons()
+                    + "，钩子看到的真实状态是 " + Native.SharedMouseButtons()
+                    + "）——合成抬起没能清掉；这时点别的窗口会没反应，请把诊断串发给我");
+            }
+
+            // 开一个 4 秒的左键探针：用户接下来那一下点击「到底发生了什么」必须留证。
+            // 四项常规诊断（捕获/光标裁剪/菜单模态/前台）都可能全是阴性，那时只剩它。
+            StartClickProbe(4000);
 
             return hidden;
         }
@@ -1003,12 +1206,19 @@ namespace DeepSeekQuake
             if (Native.IsIconic(target)) Native.ShowWindow(target, Native.SW_RESTORE);
             ForceForeground(target);
 
-            for (int i = 0; i < 2; i++)
+            // 多给两拍并**每拍重试一次**：SetForegroundWindow 被前台锁拒绝时，往往等目标
+            // 窗口（也就是我们刚藏起来的那个）真的不在了之后再试就成功。这里的时间预算很
+            // 安全——Hide() 开头已经把自己的鼠标钩子摘掉了，不用担心 LowLevelHooksTimeout。
+            for (int i = 0; i < 3; i++)
             {
                 IntPtr fg = Native.GetForegroundWindow();
                 if (fg != IntPtr.Zero && fg != _hwnd && Native.IsWindowVisible(fg)) return true;
-                Thread.Sleep(25);
+                Thread.Sleep(30);
+                ForceForeground(target);
             }
+            IntPtr last = Native.GetForegroundWindow();
+            _log.Add("收起：前台仍没落到别的窗口上（现在 fg=0x" + last.ToInt64().ToString("X")
+                + "，目标=0x" + target.ToInt64().ToString("X") + "）");
             return false;
         }
 
@@ -1180,17 +1390,47 @@ namespace DeepSeekQuake
 
         // ── 鼠标捕获 / 模态清理 ────────────────────────────────────
 
-        /// <summary>窗口所在 UI 线程当前持有的鼠标捕获窗口；没有/查不到返回 Zero。</summary>
-        private static IntPtr CaptureWindowOf(IntPtr hwnd)
+        /// <summary>
+        /// 窗口所在 UI 线程当前持有的鼠标捕获窗口。**「没有捕获」和「查不到」都返回 Zero**
+        /// ——这两者无法区分，就是「检测盲区」的来源（失败次数记在 `_gtiFailures`，
+        /// 即诊断串里的 `gterr=`）。
+        ///
+        /// 推论（2026-10-08 的教训）：**不能只凭这个返回值决定要不要清捕获**。收起路径
+        /// 一律走 `ForceDropCapture(..., forceSteal: true)`，由「强制夺回」兜住盲区——
+        /// 夺回不需要知道对方是谁，也不需要查询成功。
+        /// </summary>
+        private IntPtr CaptureWindowOf(IntPtr hwnd)
         {
-            if (hwnd == IntPtr.Zero || !Native.IsWindow(hwnd)) return IntPtr.Zero;
+            Native.GUITHREADINFO gti;
+            return TryGetThreadInfo(hwnd, out gti) ? gti.hwndCapture : IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// 读窗口所在线程的 GUITHREADINFO。查询失败（线程忙 / 跨会话 / 权限不足）会累加
+        /// 到 `_gtiFailures`——这是「捕获检测盲区」唯一的可见信号，绝不静默吞掉。
+        /// </summary>
+        private bool TryGetThreadInfo(IntPtr hwnd, out Native.GUITHREADINFO gti)
+        {
+            gti = new Native.GUITHREADINFO();
+            if (hwnd == IntPtr.Zero || !Native.IsWindow(hwnd))
+            {
+                System.Threading.Interlocked.Increment(ref _gtiFailures);
+                return false;
+            }
             uint pid;
             uint tid = Native.GetWindowThreadProcessId(hwnd, out pid);
-            if (tid == 0) return IntPtr.Zero;
-            Native.GUITHREADINFO gti = new Native.GUITHREADINFO();
+            if (tid == 0)
+            {
+                System.Threading.Interlocked.Increment(ref _gtiFailures);
+                return false;
+            }
             gti.cbSize = Marshal.SizeOf(typeof(Native.GUITHREADINFO));
-            if (!Native.GetGUIThreadInfo(tid, ref gti)) return IntPtr.Zero;
-            return gti.hwndCapture;
+            if (!Native.GetGUIThreadInfo(tid, ref gti))
+            {
+                System.Threading.Interlocked.Increment(ref _gtiFailures);
+                return false;
+            }
+            return true;
         }
 
         /// <summary>浏览器窗口所在线程的鼠标捕获（跨进程可读，诊断用）。</summary>
@@ -1267,7 +1507,7 @@ namespace DeepSeekQuake
             }
         }
         /// <summary>
-        /// 清掉目标窗口残留的鼠标捕获（capture）。
+        /// 清掉目标窗口残留的鼠标捕获（capture），返回是否**已确认**没有捕获。
         ///
         /// **为什么这一条直接决定「别的页面还能不能点」**：
         /// 实测（win32probe\out\p5_rbutton.txt 场景 C/C2）——一个持有 capture 的窗口
@@ -1277,40 +1517,413 @@ namespace DeepSeekQuake
         ///
         /// 而 capture 泄漏正是右键粘贴的必然副作用：本工具的鼠标钩子吞掉了
         /// WM_RBUTTONUP，页面收到 RBUTTONDOWN 后 SetCapture 了，却永远等不到抬起
-        /// （实测场景 B：capture 停在 0x640E16 不放）。同文件场景 C2 也证明
-        /// WM_CANCELMODE 能把它清干净，所以这里补发并校验。
+        /// （实测场景 B：capture 停在 0x640E16 不放）。
         ///
-        /// 放在 Hide() 的收尾：用户右键之后想收起时，顺手把这份残留状态一起清掉，
-        /// 保证收起之后别的窗口能正常接收点击。
+        /// **只发 WM_CANCELMODE 是不够的**：DefWindowProc 收到它确实会 ReleaseCapture，
+        /// 但对方是**别的进程**，它可以选择不处理这条消息。旧版就只发了这一条，清不掉时
+        /// 仅仅记一笔日志——于是「右键之后收起，别的窗口左键点不动，非得再右键一下才
+        /// 恢复」一直存在（用户 2026-10-08 的反馈就是这个）。现在三道防线，一道比一道强硬。
+        ///
+        /// 可以在任意线程调用：从非 UI 线程来时自动只走温和手段（见 StealCapture）。
+        ///
+        /// **`forceSteal`（2026-10-08 第二次修正的关键）**：默认 false 时，一旦检测到
+        /// 「没有捕获」就直接返回——而检测本身有盲区（`CaptureWindowOf` 查不到也返回 0，
+        /// 见 `gterr=`）。用户 20:39 那份日志里 `capfix=2` 却依旧点不动，正是这个盲区：
+        /// 防线被静默跳过，唯一能跨进程强夺的 `StealCapture` 从来没机会执行。
+        /// 收起路径因此改用 `forceSteal: true`：**不信检测，每次都夺一次**。夺回成本约 0ms，
+        /// 且不需要知道对方是谁（系统同一时刻只允许一个窗口持有捕获）。
+        /// </summary>
+        public bool ForceDropCapture(string why)
+        {
+            return ForceDropCapture(why, false);
+        }
+
+        /// <param name="forceSteal">
+        /// true = 即使检测到「没有捕获」也照样执行一次强制夺回，用来兜住检测盲区。
+        /// 只应该在「窗口已经收起」这类可以确定不该有任何捕获的时刻使用。
+        /// </param>
+        public bool ForceDropCapture(string why, bool forceSteal)
+        {
+            if (!IsWindowAlive()) return true;
+            IntPtr cap = CaptureWindowOf(_hwnd);
+            bool detected = cap != IntPtr.Zero;
+
+            // 平时：确实没检测到捕获 → 0 成本返回。
+            // 强制模式不能这样早退，否则检测盲区会连带把整条防线关掉。
+            if (!detected && !forceSteal) return true;
+
+            bool cleared = detected ? TryReleaseCapture(_hwnd, 2, 100) : true;
+            bool stolen = false;
+
+            // 第二道：对方不理会（或根本没检测到）→ 我们自己把捕获抢过来再放手。
+            // 这一手完全不依赖对方配合，也不需要查询成功。
+            if (!cleared || forceSteal)
+            {
+                stolen = StealCapture();
+                if (stolen && !cleared) cleared = CaptureWindowOf(_hwnd) == IntPtr.Zero;
+            }
+
+            // 第三道：再客气地问一次（第一道可能正好撞上目标线程忙，重发往往就过了）。
+            if (!cleared) cleared = TryReleaseCapture(_hwnd, 1, 80);
+
+            if (forceSteal) _forcedSteals++;
+
+            if (!cleared)
+            {
+                _log.Add("残留的鼠标捕获仍没清掉（" + why + "）：目标窗口所在线程可能正忙，"
+                    + "或它不肯配合；症状是「点其它窗口没反应」。心跳会继续扫。现在 cap=0x"
+                    + CaptureWindowOf(_hwnd).ToInt64().ToString("X"));
+                return false;
+            }
+
+            // 只有「确实检测到过残留」才记这条面向用户的日志——否则强制路径每次收起
+            // 都会刷一行「已清掉残留」，而实际上本来就没有残留，日志会变成噪音。
+            if (detected)
+            {
+                _captureFixes++;
+                _log.Add("已清掉残留的鼠标捕获（" + why + "，手段："
+                    + (stolen ? "强制夺回" : "WM_CANCELMODE")
+                    + "）——否则隐藏的浏览器窗口会继续抢走全桌面的点击");
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// 强行把鼠标捕获从别人手里夺走，然后**立刻放手**。
+        ///
+        /// 原理：系统同一时刻**只允许一个窗口持有捕获**（SetCapture 文档）。只要把我们
+        /// 自己线程里的某个窗口设成捕获窗口，原持有者就会被系统通知 WM_CAPTURECHANGED
+        /// 而失去捕获；随后我们马上 ReleaseCapture，不留任何副作用。对比之下：
+        /// WM_CANCELMODE 要靠对方愿意处理，补发 WM_RBUTTONUP 会把 Chrome 的原生右键
+        /// 菜单弹出来——这一手既不需要对方配合，也不会有菜单。
+        ///
+        /// 约束：SetCapture 只接受**本线程创建的窗口**，所以只能在 UI 线程上做，并且需要
+        /// 一个属于 UI 线程的句柄（Program 在消息窗口建好后注入）。任一前提不成立就返回
+        /// false，由调用方如实记录——绝不假装成功。
+        /// </summary>
+        private bool StealCapture()
+        {
+            if (Native.GetCurrentThreadId() != _uiThreadId) return false;
+            IntPtr host = IntPtr.Zero;
+            try { if (_captureHost != null) host = _captureHost(); } catch { }
+            if (host == IntPtr.Zero || !Native.IsWindow(host)) return false;
+
+            try
+            {
+                _stealAttempts++;
+                // ★ SetCapture 的**返回值就是「原来持有捕获的那个窗口」**。
+                // 这是全系统唯一能问到「到底是谁攥着捕获」的办法（GetCapture 只答本线程，
+                // GetGUIThreadInfo 只答指定线程），所以绝不能像以前那样把它丢掉
+                // ——它就是真凶的指纹。非 0 时记下来，进诊断串的 stealfrom=。
+                IntPtr prev = Native.SetCapture(host);
+                if (prev != IntPtr.Zero) _lastStealFrom = prev;
+                bool got = Native.GetCapture() == host;    // 只信 GetCapture：确认真的夺到了
+                Native.ReleaseCapture();
+                // 兜底复核：万一 ReleaseCapture 没生效，绝不能把捕获留在自己手里
+                // ——那就变成「全桌面点不动」的升级版了。再放一次。
+                if (Native.GetCapture() == host) Native.ReleaseCapture();
+                if (got) _stealGot++;
+                return got;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// 心跳里的兜底清扫：**已经收起的窗口不该再持有鼠标捕获**。
+        ///
+        /// Hide() 的收尾已经清过一次；这里处理「那一次没清干净」以及「之后又被谁拿走」
+        /// 的漏网情况。
+        ///
+        /// 两档节流：**收起后 3 秒内每拍都扫**（用户就是在这段时间里去点别的窗口的），
+        /// 之后退到 1 秒一次。敏感期内还**不信检测**——直接走强制夺回，因为
+        /// CaptureWindowOf 查不到时返回 0，与「真的没有捕获」无法区分（见 gterr）。
+        /// 平时零成本：只在真的持有捕获时才动手。
+        ///
+        /// 为什么只在「窗口真的不可见」时才动手：可见时的捕获可能是用户在正常拖拽/选词，
+        /// 抢走它会打断用户操作。
+        /// </summary>
+        public void CaptureWatchdog()
+        {
+            if (!IsWindowAlive()) return;
+            if (!ReallyHidden) return;
+
+            int now = Environment.TickCount;
+            // 「收起后的敏感期」：用户收起窗口之后**马上**就会去点别的窗口，而浏览器
+            // 完全可能在这之后又被重新拿到捕获（它仍然以为右键按着）。这段时间里
+            // ①放宽节流到每拍都扫；②**不信检测**，直接走强制夺回，兜住 gterr 盲区。
+            bool justHidden = _lastHideTick != 0 && unchecked(now - _lastHideTick) < 3000;
+            if (!justHidden && CaptureWindowOf(_hwnd) == IntPtr.Zero) return;
+
+            int throttle = justHidden ? 100 : 1000;
+            if (_lastCaptureSweepTick != 0 && unchecked(now - _lastCaptureSweepTick) < throttle) return;
+            _lastCaptureSweepTick = now;
+            ForceDropCapture("心跳复核", justHidden);
+        }
+
+        /// <summary>
+        /// 右键粘贴钩子吞掉抬起之后清一次残留捕获（保持旧调用点不变）。
+        /// 注意：这个调用点在右键粘贴那条线程池线程上，走不了「强制夺回」，只能温和地
+        /// 补发 WM_CANCELMODE——真正保底的是 Hide() 的收尾和心跳里的 CaptureWatchdog。
         /// </summary>
         public void ReleaseLeakedCapture()
         {
-            if (!IsWindowAlive()) return;
-            IntPtr cap = CaptureWindowOf(_hwnd);
-            if (cap == IntPtr.Zero) return;          // 绝大多数情况：没有泄漏，直接返回
-            if (!TryReleaseCapture(_hwnd, 2, 120))
-                _log.Add("目标窗口仍持有鼠标捕获（已补发 WM_CANCELMODE 仍未清掉）："
-                    + "此时点其它窗口也会被投递给它，表现为「桌面点不动」");
-            else
-                _log.Add("已清掉残留的鼠标捕获（右键抬起被吞掉留下的）");
+            ForceDropCapture("右键抬起被吞掉");
+        }
+
+        // ── 把「被吞掉的抬起」留下的假按下状态修回来（v2.5 的根因修复）──────
+        //
+        // 前因：右键粘贴为了不让 Chrome 弹原生右键菜单，会**吞掉** WM_RBUTTONUP。
+        // 被吞掉的那次抬起从未进入系统的输入流，于是 `GetAsyncKeyState(VK_RBUTTON)` 的
+        // 0x8000 位**一直挂着**——用户早就松手了，系统却认为右键还按着。
+        //
+        // 为什么这会造成「收起后，别的窗口左键点不动」：系统认为有键按着时，鼠标点击
+        // 被当作「拖拽还没结束」，**点击不再起激活作用**（前台不会切换，日志里
+        // fgw 变成 0x0 就是这个现象）。而这条路径**不产生任何显式捕获**，
+        // 所以 cap=/owncap=/stealfrom= 全是 0——前两轮（v2.2 三道防线、v2.3 强制夺回）
+        // 都在查捕获，方向错了，用户才会说「改了跟没改一样」。
+        // v2.4 日志里的 `btn=L-/R!/M-` 对 `shL-/R-/M-` 就是决定性证据：系统说按着，
+        // 钩子说已松开。而「再点一下右键就恢复正常」正好等于**补上一次抬起**。
+        //
+        // 修法：往输入流里补一条**合成抬起**（`MOUSEEVENTF_*UP`），把那个假状态抹掉。
+        //
+        // ★ 为什么不能直接 `SendInput` 了事——它是一条**系统级**输入，会投递给
+        //   「当前持有捕获的窗口」，没有捕获时才给光标下的窗口。直接注入的话，这条 up
+        //   会落到光标下的任意程序（在那边弹出一个右键菜单）或者正在显示的目标窗口
+        //   （Chrome 收到 RBUTTONUP 就弹它自己的原生菜单）——恰恰是吞掉抬起要避免的东西。
+        //   所以先把自己（UI 线程那个不可见消息窗口）设成捕获窗口再注入：系统同一时刻
+        //   只允许一个窗口持有捕获，于是这条 up 只会投给我们自己的窗口，别的程序
+        //   一个字节都收不到。我们那个窗口没有菜单，DefWindowProc 对它什么都不做。
+        //
+        // ★ 绝不能注入「按下」：那等于凭空替用户按一下鼠标。
+        //
+        // 安全性闸门：**只修「系统说按着 + 钩子记账说已松开」的键**。物理上真按着的键
+        // 一律不碰——否则会把用户正在按的键强行抬起来（拖拽会被打断）。
+        //
+        /// <returns>true = 此刻系统层面已经没有卡住的鼠标键（本来就干净，或刚修好）。</returns>
+        public bool PumpStuckMouseButtons(string why)
+        {
+            try
+            {
+                // 没有卡住的键 = 绝大多数情况，零成本返回。
+                if (!Native.AsyncAnyButtonStuck()) return true;
+
+                // ★ 闸门：用户手上真的拿着鼠标（有键物理按着，比如正在拖拽/框选）时
+                //    **一概不动手**。下面要抢一次捕获，而抢走捕获会直接打断他的拖拽。
+                //    返回 false 表示「现在没修」，由调用方决定要不要等下次。
+                if (Native.IsAnyMouseButtonPhysicallyDown()) return false;
+
+                int now = Environment.TickCount;
+                if (_lastPumpTick != 0 && unchecked(now - _lastPumpTick) < 200)
+                    return !Native.AsyncAnyButtonStuck();      // 刚修过，回读真实结果
+
+                // 逐键判定，只挑「假按下」的那些。
+                uint flags = 0;
+                string names = "";
+                if (Native.AsyncButtonStuck(Native.VK_LBUTTON)
+                    && !Native.SharedButtonDown(Native.VK_LBUTTON))
+                {
+                    flags |= Native.MOUSEEVENTF_LEFTUP; names += "L";
+                }
+                if (Native.AsyncButtonStuck(Native.VK_RBUTTON)
+                    && !Native.SharedButtonDown(Native.VK_RBUTTON))
+                {
+                    flags |= Native.MOUSEEVENTF_RIGHTUP; names += "R";
+                }
+                if (Native.AsyncButtonStuck(Native.VK_MBUTTON)
+                    && !Native.SharedButtonDown(Native.VK_MBUTTON))
+                {
+                    flags |= Native.MOUSEEVENTF_MIDDLEUP; names += "M";
+                }
+
+                // 系统说按着、钩子也说按着 → 用户真的按着，什么都别做。
+                if (flags == 0) return false;
+
+                _lastPumpTick = now;
+                _buttonPumps++;
+                string before = Native.AsyncMouseButtons();
+
+                // 1) 先抢到捕获：这一步之后，下面那条 up 只会投给我们自己的窗口。
+                IntPtr host = IntPtr.Zero;
+                try { if (_captureHost != null) host = _captureHost(); } catch { }
+                bool captured = false;
+                if (host != IntPtr.Zero && Native.IsWindow(host))
+                {
+                    try
+                    {
+                        Native.SetCapture(host);
+                        captured = Native.GetCapture() == host;
+                    }
+                    catch { captured = false; }
+                }
+
+                // 2) 注入抬起。
+                uint sent = Native.SendInput(1, new Native.INPUT[] { Native.MakeMouseInput(flags) },
+                    Marshal.SizeOf(typeof(Native.INPUT)));
+
+                // 3) 等这条输入落地后再放手。SendInput 只负责把它塞进输入流，
+                //    真正的投递（以及我们对捕获窗口的绑定）发生在那之后；立刻
+                //    ReleaseCapture 会留一个竞态，让这条 up 又跑到光标下的窗口去。
+                //    25ms 远小于低级钩子的 300ms 超时，安全。
+                if (captured)
+                {
+                    Thread.Sleep(25);
+                    try { Native.ReleaseCapture(); } catch { }
+                    try { if (Native.GetCapture() == host) Native.ReleaseCapture(); } catch { }
+                }
+
+                string after = Native.AsyncMouseButtons();
+                string note = "已注入合成抬起(" + names + ") " + before + "→" + after
+                    + " 因:" + why;
+                if (sent != 1)
+                    note += " ⚠ SendInput 失败 sent=" + sent + " err=" + Marshal.GetLastWin32Error();
+                if (!captured) note += "（未能先取得捕获，这次注入可能落到别的窗口）";
+                _lastPumpResult = note;
+                _log.Add(note);
+
+                if (sent == 1 && !Native.AsyncAnyButtonStuck())
+                    _log.Add("被卡住的鼠标状态已清干净（" + names + "）——收起后左键应该能直接点别的窗口了");
+                return !Native.AsyncAnyButtonStuck();
+            }
+            catch (Exception ex)
+            {
+                _log.Add("注入合成抬起异常: " + ex.Message);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 延迟请求一次鼠标状态修复。**必须在 UI 线程调用**（注入前要先用捕获重定向，
+        /// 而 SetCapture 只接受调用线程自己创建的窗口）。
+        ///
+        /// 为什么要延迟而不是立刻做：右键抬起被吞掉的那一瞬间，浏览器还在处理这次右键
+        /// （菜单判定、选区、光标位置），等它安静下来再动更稳。真正保底的是 Hide() 里
+        /// 那一次同步修复——用户症状就发生在收起那一刻。
+        /// </summary>
+        public void RequestButtonPump(string why, int delayMs)
+        {
+            _pumpWhy = why;
+            _pumpDueTick = Environment.TickCount + delayMs;
+        }
+
+        /// <summary>心跳里执行到点的鼠标状态修复。没有请求时零成本。</summary>
+        public void PumpWatchdog()
+        {
+            if (_pumpDueTick == 0) return;
+            if (unchecked(_pumpDueTick - Environment.TickCount) > 0) return;
+            _pumpDueTick = 0;
+
+            // 用户此刻正按着鼠标（拖拽/框选中）→ 让路，过一拍再来。上限 20 次
+            // （≈10 秒），避免一直重排。真正保底的是 Hide() 里那次同步修复。
+            if (Native.IsAnyMouseButtonPhysicallyDown() && _pumpRetries < 20)
+            {
+                _pumpRetries++;
+                _pumpDueTick = Environment.TickCount + 500;
+                return;
+            }
+            _pumpRetries = 0;
+            PumpStuckMouseButtons(_pumpWhy);
+        }
+
+        // ── 收起后的「左键探针」────────────────────────────────────
+        // 只观测，绝不吞消息。用来回答四个问题：用户点在哪、眼睛看到的是哪个窗口、
+        // 点击前谁在前台、点击后前台有没有变。四项常规诊断全阴性时，只能靠它取证。
+
+        /// <summary>收起后开一个短命的左键探针（毫秒）。必须在 UI 线程调用。</summary>
+        public void StartClickProbe(int ms)
+        {
+            if (Native.GetCurrentThreadId() != _uiThreadId) return;
+            _probeUntilTick = Environment.TickCount + ms;
+            _probeClicks = 0;
+            _probeAwait = null;
+            if (_probeHook != IntPtr.Zero) return;          // 已经在探
+            try
+            {
+                _probeProc = ProbeProc;
+                _probeHook = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, _probeProc,
+                    Native.GetModuleHandle(null), 0);
+                if (_probeHook == IntPtr.Zero) _probeProc = null;
+            }
+            catch { _probeHook = IntPtr.Zero; _probeProc = null; }
+        }
+
+        public void StopClickProbe()
+        {
+            if (_probeHook == IntPtr.Zero) return;
+            try { Native.UnhookWindowsHookEx(_probeHook); } catch { }
+            _probeHook = IntPtr.Zero;
+            _probeProc = null;
+        }
+
+        private IntPtr ProbeProc(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            try
+            {
+                if (nCode >= 0)
+                {
+                    if (unchecked(_probeUntilTick - Environment.TickCount) <= 0)
+                    {
+                        StopClickProbe();                   // 过期自己收工
+                    }
+                    else if (wParam.ToInt32() == Native.WM_LBUTTONDOWN)
+                    {
+                        _probeClicks++;
+                        if (_probeAwait == null)            // 只详记**第一下**——那才是用户说的「点不动」
+                        {
+                            Native.POINT pt;
+                            Native.GetCursorPos(out pt);
+                            _probeFgBefore = Native.GetForegroundWindow();
+                            _probeAwait = "左键探针: 第 1 下点(" + pt.x + "," + pt.y + ")"
+                                + " 眼睛看到=" + Native.DescribeAt(pt)
+                                + " 点击前前台=0x" + _probeFgBefore.ToInt64().ToString("X");
+                        }
+                    }
+                }
+            }
+            catch { }
+            return Native.CallNextHookEx(_probeHook, nCode, wParam, lParam);
+        }
+
+        /// <summary>
+        /// 心跳里调用：给上一次探针记录补上「点击后前台」，并给出判定。
+        /// 判定只是线索，不是定论——如果用户点的本来就是当前前台窗口，前台也不会变。
+        /// </summary>
+        public void FinishClickProbe()
+        {
+            if (_probeAwait == null) return;
+            string head = _probeAwait;
+            _probeAwait = null;
+            IntPtr after = IntPtr.Zero;
+            try { after = Native.GetForegroundWindow(); } catch { }
+            string verdict = after == _probeFgBefore
+                ? " 点击后前台=0x" + after.ToInt64().ToString("X")
+                  + " → 没变（可能点的是已在前台的窗口，也可能这一下被吃掉了）"
+                : " 点击后前台=0x" + after.ToInt64().ToString("X") + " → 已切换，这一下生效了";
+            _probeLast = head + verdict;
+            _log.Add(_probeLast);
         }
 
         /// <summary>
         /// 对 hwnd 所在线程的 capture 窗口补发 WM_CANCELMODE。
-        /// 返回 true = 已确认 capture 为空。WM_CANCELMODE 走 DefWindowProc 会释放捕获，
-        /// 比补发 WM_RBUTTONUP 安全——后者会把 Chrome 原生右键菜单弹出来。
+        /// WM_CANCELMODE 走 DefWindowProc 会释放捕获，比补发 WM_RBUTTONUP 安全
+        /// ——后者会把 Chrome 原生右键菜单弹出来。
+        ///
+        /// **返回 true 只在「查询成功、且确认 capture 为空」时给出。**
+        /// 旧写法在 `GetGUIThreadInfo` 失败时也算「已清空」，于是整条防线（包括后面
+        /// 唯一能跨进程强夺的 `StealCapture`）会被静默跳过——这正是 2026-10-08
+        /// 用户日志里「capfix 有数却依旧点不动」的成因。查询失败改为累加 `_gtiFailures`。
         /// </summary>
-        private static bool TryReleaseCapture(IntPtr hwnd, int attempts, uint perTryTimeoutMs)
+        private bool TryReleaseCapture(IntPtr hwnd, int attempts, uint perTryTimeoutMs)
         {
+            Native.GUITHREADINFO gti;
             for (int i = 0; i < attempts; i++)
             {
-                IntPtr cap = CaptureWindowOf(hwnd);
-                if (cap == IntPtr.Zero) return true;
-                SendCancelMode(cap, perTryTimeoutMs);
+                if (!TryGetThreadInfo(hwnd, out gti)) return false;   // 查不到 → 不敢说已经清掉了
+                if (gti.hwndCapture == IntPtr.Zero) return true;
+                SendCancelMode(gti.hwndCapture, perTryTimeoutMs);
                 SendCancelMode(hwnd, perTryTimeoutMs);
                 Thread.Sleep(20);
             }
-            return CaptureWindowOf(hwnd) == IntPtr.Zero;
+            return TryGetThreadInfo(hwnd, out gti) && gti.hwndCapture == IntPtr.Zero;
         }
 
         /// <summary>
@@ -1329,14 +1942,15 @@ namespace DeepSeekQuake
 
             bool captureCleared = TryReleaseCapture(hwnd, 1, 80);
 
-            uint pid;
-            uint tid = Native.GetWindowThreadProcessId(hwnd, out pid);
-            if (tid != 0)
+            Native.GUITHREADINFO gti;
+            if (TryGetThreadInfo(hwnd, out gti))
             {
-                Native.GUITHREADINFO gti = new Native.GUITHREADINFO();
-                gti.cbSize = Marshal.SizeOf(typeof(Native.GUITHREADINFO));
-                if (Native.GetGUIThreadInfo(tid, ref gti))
-                    SendCancelMode(gti.hwndFocus, 60);
+                SendCancelMode(gti.hwndFocus, 60);
+                // 模态菜单循环会**自己**吃掉点击，和捕获残留是两回事（症状一模一样）。
+                // 菜单宿主是 hwndMenuOwner，WM_CANCELMODE 必须直接送给它才拆得掉；
+                // 移动/缩放循环同理（hwndMoveSize）。
+                SendCancelMode(gti.hwndMenuOwner, 60);
+                SendCancelMode(gti.hwndMoveSize, 60);
             }
             SendCancelMode(hwnd, 60);
             return captureCleared;
