@@ -1,16 +1,37 @@
-# 忽略浏览器配置文件，绝对不要上传这些
+# ── 绝不入库的东西 ─────────────────────────────────────────────
+
+# 浏览器登录态 / 缓存（体积大，且含个人隐私）
 chrome-profile/
+chrome-profile-edge/
 
-# 忽略生成的可执行文件和快捷方式（建议通过 Releases 发布）
+# 构建产物与快捷方式：成品一律通过 GitHub Releases 发布，不入库
 *.exe
+*.pdb
 *.lnk
+build/
+dist/
 
-# 忽略系统缓存和测试文件
+# 本机配置（含个人路径 / 热键偏好）
+hotkey.conf
+
+# 第三方依赖
+node_modules/
+
+# ── 开发过程产物（调研 / 审计 / 复现 / 验证现场）────────────────
+# 这些目录体积大、只对当时那轮排查有意义，留在本地即可。
 audit/
+audit-2/
 backup/
 diag/
 recon/
+repro/
 verify/
+win32fix/
+win32probe/
+.backup/
+*.bundle
 
-# 忽略配置文件（根据情况决定是否保留）
-hotkey.conf
+# ── 杂项 ───────────────────────────────────────────────────────
+Thumbs.db
+desktop.ini
+*.log

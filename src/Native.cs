@@ -6,6 +6,7 @@
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 namespace DeepSeekQuake
 {
@@ -32,6 +33,26 @@ namespace DeepSeekQuake
 
         [DllImport("user32.dll")]
         public static extern bool IsIconic(IntPtr hWnd);
+
+        /// <summary>
+        /// 窗口是否已被系统判定为「无响应」（目标线程不泵消息超过约 5 秒）。
+        /// 用于诊断「收起没生效」到底是浏览器卡住了，还是本工具自己的缺陷。
+        /// </summary>
+        [DllImport("user32.dll")]
+        public static extern bool IsHungAppWindow(IntPtr hWnd);
+
+        // ── 窗口位置枚举（交叉核对「到底隐藏了没有」时要用的常量）──────
+        // 为什么要交叉核对：ShowWindowAsync 只是往目标线程投一条请求，
+        // 目标线程不处理时它会"报告成功"但什么都没发生，只信一个信号会误判。
+        // 注意：SW_HIDE / SW_SHOW / SW_RESTORE 本文件里已经有了，不要再定义。
+        public const int GWL_STYLE = -16;
+        public const int WS_VISIBLE = 0x10000000;
+
+        public const int SW_SHOWNORMAL = 1;
+        public const int SW_SHOWNOACTIVATE = 4;
+        public const int SW_MINIMIZE = 6;
+        public const int SW_SHOWMINNOACTIVE = 7;
+        public const int SW_SHOWNA = 8;
 
         [DllImport("user32.dll")]
         public static extern bool SetForegroundWindow(IntPtr hWnd);
@@ -324,6 +345,10 @@ namespace DeepSeekQuake
         public const long WS_EX_TOOLWINDOW = 0x80L;
         public const long WS_EX_APPWINDOW = 0x40000L;
 
+        /// <summary>置顶状态就存在这个扩展样式位里。清掉它 = 取消置顶，
+        /// 而且是本地操作，不像 SetWindowPos 那样要等目标线程。</summary>
+        public const long WS_EX_TOPMOST = 0x08L;
+
         public const int SW_HIDE = 0;
         public const int SW_SHOW = 5;
         public const int SW_RESTORE = 9;
@@ -334,6 +359,17 @@ namespace DeepSeekQuake
         public const uint SWP_NOACTIVATE = 0x0010;
         public const uint SWP_FRAMECHANGED = 0x0020;
         public const uint SWP_SHOWWINDOW = 0x0040;
+
+        /// <summary>
+        /// 跨线程/跨进程调用 SetWindowPos 时，让系统把请求异步投递给目标线程的队列，
+        /// **立刻返回**而不是等它处理完。
+        ///
+        /// 为什么必须知道这个标志：同步 SetWindowPos 会一直等目标线程泵消息。实测
+        /// （audit-2\host\NT_HostProbe 的 t1）目标线程一旦不泵消息，同步 SetWindowPos
+        /// **8000ms 都不返回**，只有结束那个进程才返回——而它本来只是个「顺手取消置顶」
+        /// 的收尾动作。UI 线程卡在这里 = 双击 Ctrl 永远收不回去。
+        /// </summary>
+        public const uint SWP_ASYNCWINDOWPOS = 0x4000;
 
         // SetWindowPos 的特殊 hWndInsertAfter 值（IntPtr 不能做 const）
         public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
@@ -356,9 +392,11 @@ namespace DeepSeekQuake
 
         public const int WM_MOUSEMOVE = 0x0200;
         public const int WM_LBUTTONDOWN = 0x0201;
+        public const int WM_LBUTTONUP = 0x0202;
         public const int WM_RBUTTONDOWN = 0x0204;
         public const int WM_RBUTTONUP = 0x0205;
         public const int WM_MBUTTONDOWN = 0x0207;
+        public const int WM_MBUTTONUP = 0x0208;
         public const int WM_MOUSEWHEEL = 0x020A;
         public const int WM_XBUTTONDOWN = 0x020B;
         public const int WM_MOUSEHWHEEL = 0x020E;
@@ -402,6 +440,9 @@ namespace DeepSeekQuake
         public const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
 
         public const uint SMTO_ABORTIFHUNG = 0x0002;
+
+        /// <summary>空消息。用 SendMessageTimeout 发它 = 探测目标线程是否在泵消息。</summary>
+        public const uint WM_NULL = 0x0000;
 
         public const int ERROR_HOTKEY_ALREADY_REGISTERED = 1409;
 
@@ -466,13 +507,71 @@ namespace DeepSeekQuake
             return (GetAsyncKeyState(vk) & 0x8000) != 0;
         }
 
-        /// <summary>此刻是否有任意鼠标按键按下（配合低级鼠标钩子识别 Ctrl+鼠标手势）。</summary>
+        /// <summary>
+        /// 此刻是否有任意鼠标按键按下（配合低级鼠标钩子识别 Ctrl+鼠标手势）。
+        ///
+        /// ⚠️ **不要用它做热键状态机的判据**：它读的是 GetAsyncKeyState，而右键粘贴
+        /// 会吞掉 WM_RBUTTONUP，被吞掉的那次抬起之后 VK_RBUTTON 的 0x8000 位会
+        /// **永远挂着**，这个函数从此恒为真。热键那边请用
+        /// <see cref="IsAnyMouseButtonPhysicallyDown"/>。
+        /// </summary>
         public static bool IsAnyMouseButtonDown()
         {
             return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0
                 || (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0
                 || (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0
                 || (GetAsyncKeyState(VK_XBUTTON1) & 0x8000) != 0
+                || (GetAsyncKeyState(VK_XBUTTON2) & 0x8000) != 0;
+        }
+
+        // ── 鼠标按键的「共享真实状态」─────────────────────────────────
+        //
+        // 为什么需要它：进程里有**两条**低级鼠标钩子——
+        //   * HotkeyManager 的手势守卫钩子（装在专用钩子线程）
+        //   * BrowserHost 的右键粘贴钩子（装在 UI 线程）
+        // 钩子链是**后装的先跑**，而右键粘贴钩子通常后装 → 它先看到 WM_RBUTTONUP
+        // 并 `return 1` 吞掉 → **守卫钩子根本看不到那次抬起**。所以只靠守卫钩子
+        // 自己记账，右键按下的状态会一直挂着；而它读 GetAsyncKeyState 同样中毒。
+        // 两边都必须走这份共享状态，并且由**吞掉抬起的那一方**主动清掉。
+        private static volatile bool _mouseL, _mouseR, _mouseM;
+        private static volatile int _swallowedRmbUp;
+
+        /// <summary>低级鼠标钩子记账：按键的真实物理状态（钩子看得最全，不受吞事件影响）。</summary>
+        public static void NoteMouseButton(int msg, bool down)
+        {
+            if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP) _mouseL = down;
+            else if (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP) _mouseR = down;
+            else if (msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP) _mouseM = down;
+        }
+
+        /// <summary>
+        /// 右键粘贴吞掉了一次 WM_RBUTTONUP：告诉所有人这颗键**物理上已经松开**。
+        /// 不这么做，守卫方的判据还会以为右键一直按着 → 第一敲永不武装 →
+        /// 此后每一次双击 Ctrl 都被静默忽略（用户症状：右键一次之后收不回去）。
+        /// </summary>
+        public static void NoteRmbUpSwallowed()
+        {
+            _mouseR = false;
+            Interlocked.Increment(ref _swallowedRmbUp);
+        }
+
+        public static int SwallowedRmbUps { get { return _swallowedRmbUp; } }
+
+        /// <summary>把共享鼠标按键状态清干净（切换热键 / 卸载钩子时调用，避免陈旧状态）。</summary>
+        public static void ResetMouseButtonState()
+        {
+            _mouseL = _mouseR = _mouseM = false;
+        }
+
+        /// <summary>
+        /// 供热键状态机使用的判据：真实物理状态 + 共享记账，**不会被吞事件或
+        /// GetAsyncKeyState 残留带偏**。
+        /// </summary>
+        public static bool IsAnyMouseButtonPhysicallyDown()
+        {
+            if (_mouseL || _mouseR || _mouseM) return true;
+            // 中键/侧键从不被我们吞掉，GetAsyncKeyState 对它们可信。
+            return (GetAsyncKeyState(VK_XBUTTON1) & 0x8000) != 0
                 || (GetAsyncKeyState(VK_XBUTTON2) & 0x8000) != 0;
         }
 

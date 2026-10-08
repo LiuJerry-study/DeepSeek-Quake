@@ -180,19 +180,23 @@ Head "3) 切换链路（合成切换消息）"
 if ($trace -eq [IntPtr]::Zero) { Warn "拿不到诊断窗口，跳过" }
 elseif ($target -eq [IntPtr]::Zero) { Warn "没有目标窗口，跳过" }
 else {
-    # 先直接收起，从确定状态开始测：如果窗口「可见但被前台窗口挡住」，
-    # 第一次按热键按设计只是尝试提到前台（可能被更高权限的前台窗口拒绝），
-    # 可见性不会变，会把这里误报成失败。
+    # 先直接收起，从确定状态开始测。现在「窗口可见就收起」，不再区分是否在前台。
+    # （注意：测试期间若用户手动按热键，会并发改变可见性，可能让这一项误报。）
+    #
+    # wParam 带真实 TickCount：热键链路投递 WM_APP_TOGGLE 时就是这么填的。
+    # 以前这里填 0，等于跳过了那段时间戳判断，于是「收不回去」这个缺陷在自检里
+    # 完全没有覆盖（上一版就是这么漏掉的）。保持和真实投递同形，才不会白测。
+    $stamp = [IntPtr][Environment]::TickCount
     [void][QuakeCheck]::ShowWindow($target, 0)
     Start-Sleep -Milliseconds 700
     $before = [QuakeCheck]::IsWindowVisible($target)
-    [void][QuakeCheck]::PostMessage($trace, 0x8000 + 0x50, [IntPtr]::Zero, [IntPtr]::Zero)  # WM_APP_TOGGLE
+    [void][QuakeCheck]::PostMessage($trace, 0x8000 + 0x50, $stamp, [IntPtr]::Zero)  # WM_APP_TOGGLE
     Start-Sleep -Milliseconds $WaitMs
     $after1 = [QuakeCheck]::IsWindowVisible($target)
     if ($before -ne $after1) { Pass "可见性翻转：$before → $after1" }
     else { Fail "可见性没变（$before → $after1），说明小工具没有真正操作用这个窗口" }
 
-    [void][QuakeCheck]::PostMessage($trace, 0x8000 + 0x50, [IntPtr]::Zero, [IntPtr]::Zero)
+    [void][QuakeCheck]::PostMessage($trace, 0x8000 + 0x50, [IntPtr][Environment]::TickCount, [IntPtr]::Zero)
     Start-Sleep -Milliseconds $WaitMs
     $after2 = [QuakeCheck]::IsWindowVisible($target)
     if ($after2 -eq $before) { Pass "再次切换回到原状态：$after1 → $after2" }

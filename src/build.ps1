@@ -51,8 +51,27 @@ Write-Host ("编译成功: {0}  ({1:N0} 字节, {2})" -f $fi.Name, $fi.Length, $
 # 本目录可能带着 DSH/沙箱设置的 Low 完整性标签（(OI)(CI) 继承）。
 # 从带 Low 标签的 exe 启动，Windows 会把进程也按低完整性创建，
 # 小工具会因此拒绝运行（低完整性下热键不可能生效）。编译后显式放宽到 Medium。
+#
+# 注意：如果**目录**上带着 (OI)(CI) 的 Low 标签，只给单个文件设 Medium 往往不生效——
+# 新文件会继续继承 Low。所以这里设完必须**复验**，不通过就明确报错，绝不静默放过
+# （上一版就是静默失效，结果用户双击后只看到「检测到低完整性」的警告）。
 try { & icacls $Out /setintegritylevel Medium | Out-Null }
 catch { Write-Host "设置产物完整性标签失败（不影响编译）: $_" -ForegroundColor Yellow }
+
+$label = (& icacls $Out 2>&1 | Out-String)
+if ($label -match 'Mandatory Label\\Low') {
+    Write-Host ""
+    Write-Host "！！产物被打上了 Low 完整性标签，双击会弹「检测到低完整性」并拒绝运行。" -ForegroundColor Red
+    Write-Host "   根因通常是**本目录**带着 Low 标签的强制继承，逐个文件改没用。" -ForegroundColor Red
+    Write-Host "   修法（一条命令，在正常桌面会话里跑）：" -ForegroundColor Yellow
+    Write-Host "     pwsh -NoProfile -File `"$PSScriptRoot\fix-integrity.ps1`"" -ForegroundColor Yellow
+    Write-Host "   它会同时把标签修好并（加 -Swap）把新版换成正式 exe。" -ForegroundColor Yellow
+    Write-Host ""
+    exit 2
+}
+Write-Host "产物完整性标签: " -NoNewline
+Write-Host (($label -split "`n" | Select-String 'Mandatory' | ForEach-Object { $_.ToString().Trim() }) -join ' / ') -ForegroundColor Green
+
 
 Write-Host ""
 Write-Host "跑内置自测…" -ForegroundColor Cyan

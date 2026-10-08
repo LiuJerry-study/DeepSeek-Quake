@@ -61,6 +61,8 @@ namespace DeepSeekQuake
         private volatile bool _lastShowMissedForeground;      // 最近一次显示没能在前台（被更高权限窗口挡住）
         private IntPtr _lastForeground = IntPtr.Zero;
         private string _titleHint = "DeepSeek";
+        private volatile bool _hidePending;      // 上一次收起没确认落地，等 SyncTick 复核
+        private volatile int _lastHideTries;     // 最近一次收起试了几次才成功（诊断用）
 
         // 鼠标钩子
         private IntPtr _mouseHook = IntPtr.Zero;
@@ -808,20 +810,8 @@ namespace DeepSeekQuake
             EnsureToolWindow(_hwnd);
             if (Native.IsIconic(_hwnd)) Native.ShowWindow(_hwnd, Native.SW_RESTORE);
 
-            // 显示用同步调用，并且**当场校验结果**。
-            // 收起那一侧用的是 ShowWindowAsync（避免 Chrome 卡住时把我们也卡住），
-            // 但异步隐藏有可能在「显示」之后才落地，把窗口又收回去——用户看到的就是
-            // 「双击 Ctrl 能收起，但再也呼不出来」。所以这里循环确认，
-            // 不发指令就完事：真的可见了才算成功。
-            for (int i = 0; i < 3; i++)
-            {
-                Native.ShowWindowAsync(_hwnd, Native.SW_SHOW);
-                Native.ShowWindow(_hwnd, Native.SW_SHOW);
-                Thread.Sleep(60);
-                if (Native.IsWindowVisible(_hwnd) && !Native.IsIconic(_hwnd)) break;
-                _log.Add("显示后窗口仍不可见，重试第 " + (i + 2) + " 次");
-            }
-
+            // 显示。和 Hide() 走同一个两阶段函数（理由见 SetVisibleCore 的注释）。
+            SetVisibleCore(true);
             ForceForeground(_hwnd);
             // 记住这一下到底有没有真的提到前台。如果前台是更高权限的窗口
             // （UIPI 不允许 Medium 进程抢它的焦点），热键不能永远只会「显示」，
@@ -830,35 +820,42 @@ namespace DeepSeekQuake
             SyncMouseHook();
         }
 
-        public void Hide()
+        /// <summary>
+        /// 收起窗口。返回 true = 已确认窗口不再可见。
+        ///
+        /// **为什么这个函数必须尽快返回（本文件最重要的约束）**：
+        /// 右键粘贴用的 WH_MOUSE_LL 钩子装在 UI 线程上（InstallMouseHook），而低级钩子
+        /// 的回调是由安装它的线程调用的。UI 线程一旦在这里长时间不返回，**整个系统的
+        /// 鼠标输入都会卡在我们的回调里**；超过系统 LowLevelHooksTimeout（约 300ms）后
+        /// Windows 会把钩子**静默摘掉**（句柄仍非零，API 也查不出来）。表现就是用户说的
+        /// 「收不回去，而且别的页面也点不动」。所以这里所有等待都必须短，累计远小于 300ms。
+        ///
+        /// 另外：对**挂死**的目标线程，只有 ShowWindowAsync / SendMessageTimeout 会立刻返回；
+        /// 同步的 ShowWindow / SetWindowPos 会一直阻塞（实测 45 秒都不返回，见
+        /// win32probe\out\p1_matrix.txt CASE 5/6）。所以这里一律不用同步 ShowWindow。
+        /// </summary>
+        public bool Hide()
         {
-            if (!IsWindowAlive()) return;
+            if (!IsWindowAlive()) return true;
             bool wasOurs = IsOursForeground();
 
             UninstallMouseHook();
             _armed = false;
 
-            // 1) 清鼠标捕获/模态：以前只发一次且不看结果；现在带重试和校验。
+            // 1) 清鼠标捕获/模态。必须带超时且总耗时可控——这里以前最多能拖到 1.6 秒，
+            //    正好卡在「右键之后想收起」的热路径上。
             if (!CancelMouseModes(_hwnd))
                 _log.Add("收起：鼠标捕获未确认解除（已重试）");
 
             _lastShowMissedForeground = false;
 
-            // 2) 异步隐藏必须确认结果。ShowWindowAsync 返回 ≠ 已经隐藏：
-            //    窗口还留在屏幕上时，收起后的第一下点击会被前台/激活逻辑吃掉，
-            //    表现就是「点桌面没反应，再点一下才正常」。
-            bool hidden = false;
-            for (int i = 0; i < 6; i++)
-            {
-                Native.ShowWindowAsync(_hwnd, Native.SW_HIDE);
-                Thread.Sleep(50);
-                if (!Native.IsWindowVisible(_hwnd)) { hidden = true; break; }
-                _log.Add("收起后窗口仍可见，重试第 " + (i + 2) + " 次");
-            }
-            if (!hidden)
-                _log.Add("收起失败：窗口一直保持可见 hwnd=0x" + _hwnd.ToInt64().ToString("X"));
+            // 2) 收起。分两个阶段，这是本次修复的核心。
+            //
+            // 2) 真正的收起动作。两阶段实现见 SetVisibleCore 的注释。
+            bool hidden = SetVisibleCore(false);
 
             // 3) 前台必须交还给别的窗口并确认。交还失败时，第一下点击只会起激活作用。
+            //    核对只做 2 轮 × 30ms。
             if (wasOurs && _restoreFocus)
             {
                 if (!RestorePreviousForeground())
@@ -868,12 +865,131 @@ namespace DeepSeekQuake
             {
                 _log.Add("收起：前台仍指向已隐藏的窗口（restorefocus 关闭时无法自动交还）");
             }
+
+            // 4) 兜底：无论前面走了哪条分支，都不能把窗口留在「置顶」状态。
+            //    本机没有任务栏、没有 Alt+Tab，一个永久置顶的窗口会把桌面彻底挡死。
+            EnsureNotTopmost();
+
+            // 5) 清掉可能残留的鼠标捕获。这一步直接决定「别的页面还能不能点」，
+            //    原因见 ReleaseLeakedCapture 的注释。
+            ReleaseLeakedCapture();
+
+            return hidden;
+        }
+
+        /// <summary>
+        /// 显示 / 隐藏目标窗口的核心实现。**两个方向共用**，因为约束完全一样。
+        ///
+        /// 两阶段设计（这是「收不回去」的真正修法）：
+        ///
+        ///   阶段 A：`ShowWindowAsync` + 短重试。它只往目标线程的消息队列**投一条请求**
+        ///           就立刻返回，绝不会阻塞我们。但它有个致命性质：**队列主人不处理时，
+        ///           它返回成功却什么都不做**。实测 win32probe\out\p1_matrix.txt CASE 4
+        ///           ——对不泵消息的窗口调 `ShowWindowAsync(SW_HIDE)`，0~2ms 返回 True，
+        ///           而 `IsWindowVisible` 始终是 True。旧版只有阶段 A，于是「收起」报成功、
+        ///           窗口却还在屏幕上；用户再按一次，工具看到"已经不可见"就去执行"呼出"，
+        ///           结果什么都不变——这就是「怎么按都收不回去」。
+        ///
+        ///   阶段 B：同步 `ShowWindow`。它**一定生效**，但在目标线程不泵消息时
+        ///           **永久阻塞**（同文件 CASE 5/6：45 秒都不返回），会把我们的 UI 线程
+        ///           和挂在它上面的低级鼠标钩子一起拖死。所以不能无条件用，必须先探测。
+        ///
+        /// 探测：`SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG, 150ms)`。目标线程不响应时
+        /// `SMTO_ABORTIFHUNG` 让它**立刻**返回 0（不等满 150ms），所以探测几乎不花时间。
+        ///
+        /// **时间预算**：这个函数在 UI 线程上被热键链路调用，而右键粘贴的 WH_MOUSE_LL
+        /// 钩子就装在这个线程上。钩子回调超过系统 LowLevelHooksTimeout（约 300ms）会被
+        /// Windows **静默摘掉**，表现就是「热键突然全不灵 + 鼠标也卡」。所以等待必须短：
+        /// 目标线程正常时 4×15+10 = 70ms，异常时最多 8×25 = 200ms。
+        /// </summary>
+        private bool SetVisibleCore(bool show)
+        {
+            if (_hwnd == IntPtr.Zero || !Native.IsWindow(_hwnd)) return true;
+
+            bool pump = IsPumping(_hwnd);
+            int tries = 0;
+
+            // 阶段 A：异步 + 短重试（线程卡住时多投几次，等它自己缓过来）
+            int phaseA = pump ? (show ? 5 : 4) : (show ? 10 : 8);
+            for (int i = 0; i < phaseA; i++)
+            {
+                tries++;
+                Native.ShowWindowAsync(_hwnd, show ? Native.SW_SHOW : Native.SW_HIDE);
+                Thread.Sleep(pump ? 15 : 25);
+                if (IsDone(show)) break;
+            }
+
+            // 阶段 B：确认它在处理消息了 → 同步调用安全且一定生效
+            if (!IsDone(show) && IsPumping(_hwnd))
+            {
+                tries++;
+                Native.ShowWindow(_hwnd, show ? Native.SW_SHOW : Native.SW_HIDE);
+                Thread.Sleep(10);
+                if (!IsDone(show) && show)
+                {
+                    // 显示多一手兜底：不带激活地显示 + 强制刷新框架。
+                    // 隐藏不需要，因为 SW_HIDE 已经改掉了 WS_VISIBLE 样式位。
+                    Native.ShowWindow(_hwnd, Native.SW_SHOWNOACTIVATE);
+                    Native.SetWindowPos(_hwnd, IntPtr.Zero, 0, 0, 0, 0,
+                        Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOZORDER
+                        | Native.SWP_NOACTIVATE | Native.SWP_SHOWWINDOW | Native.SWP_ASYNCWINDOWPOS);
+                }
+            }
+
+            _lastHideTries = tries;
+            bool done = IsDone(show);
+            if (!done)
+            {
+                // 目标线程既不处理异步请求、又不敢用同步调用（会同归于尽）——
+                // 先回去，交给心跳复核，并把原因如实写清楚（绝不谎报成功）。
+                Native.ShowWindowAsync(_hwnd, show ? Native.SW_SHOW : Native.SW_HIDE);
+                if (!show) _hidePending = true;
+                _log.Add((show ? "呼出" : "收起") + "未确认生效（pump=" + (pump ? 1 : 0)
+                    + "）——浏览器没有响应窗口命令；已补发请求并在心跳里复核。"
+                    + "诊断: " + VisibleDiagnosis);
+            }
+            else if (!show)
+            {
+                _hidePending = false;
+            }
+            return done;
+        }
+
+        /// <summary>目标状态到了没有：显示 = 可见且未最小化；隐藏 = 真的不可见。</summary>
+        private bool IsDone(bool show)
+        {
+            if (show) return Native.IsWindowVisible(_hwnd) && !Native.IsIconic(_hwnd);
+            return IsReallyHidden(_hwnd);
+        }
+
+        /// <summary>
+        /// 由 SyncTick 每拍调用的复核：如果上一拍收起没落地，这里再补发一次。
+        /// 放在心跳里做，是为了不在热路径上阻塞 UI 线程（见 Hide 的说明）。
+        /// </summary>
+        public void VerifyHideLanded()
+        {
+            if (!IsWindowAlive()) return;
+            if (!_hidePending) return;
+            if (!Native.IsWindowVisible(_hwnd))
+            {
+                _hidePending = false;
+                return;
+            }
+            Native.ShowWindowAsync(_hwnd, Native.SW_HIDE);
+            if (!Native.IsWindowVisible(_hwnd))
+            {
+                _hidePending = false;
+                _log.Add("收起复核：窗口已隐藏（补发的异步请求生效）");
+            }
         }
 
         /// <summary>
         /// 把前台交还给收起前的窗口，并确认结果。
         /// 返回 true = 前台已落在别的可见窗口上。以前发一次 SetForegroundWindow 就算完，
         /// 失败时前台会悬着，用户收起后的第一下点击就会被系统当成激活点击吞掉。
+        ///
+        /// 等待只做 2 轮 × 25ms：这个函数在 UI 线程上被 Hide() 调用，多等就是拿钩子的
+        /// 存活时间换准确性（见 Hide 的说明）。
         /// </summary>
         public bool RestorePreviousForeground()
         {
@@ -887,11 +1003,11 @@ namespace DeepSeekQuake
             if (Native.IsIconic(target)) Native.ShowWindow(target, Native.SW_RESTORE);
             ForceForeground(target);
 
-            for (int i = 0; i < 5; i++)
+            for (int i = 0; i < 2; i++)
             {
                 IntPtr fg = Native.GetForegroundWindow();
                 if (fg != IntPtr.Zero && fg != _hwnd && Native.IsWindowVisible(fg)) return true;
-                Thread.Sleep(40);
+                Thread.Sleep(25);
             }
             return false;
         }
@@ -934,18 +1050,34 @@ namespace DeepSeekQuake
                 // 已经 Show 出来，却仍被前台窗口完全盖住——用户看到的就是「按热键
                 // 像没反应」。对此再补一手：短暂置顶再取消置顶，把目标窗口提到当前
                 // 前台窗口之上的普通 Z 序，同时不依赖 SetForegroundWindow 成功。
+                //
+                // 这一手必须包在 try/finally 里：置顶之后如果抛异常或提前返回，
+                // 窗口会**永久停在最前面**。本机没有任务栏、也没有 Alt+Tab 条目，
+                // 一个永久置顶的窗口会把桌面彻底挡死，除了按热键没有任何办法。
                 string raiseInfo = "";
                 if (hwnd == _hwnd && !IsOursForeground())
                 {
-                    bool top = Native.SetWindowPos(hwnd, Native.HWND_TOPMOST, 0, 0, 0, 0,
-                        Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE | Native.SWP_SHOWWINDOW);
-                    Thread.Sleep(50);
-                    bool notop = Native.SetWindowPos(hwnd, Native.HWND_NOTOPMOST, 0, 0, 0, 0,
-                        Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
-                    Thread.Sleep(30);
-                    bool set2 = Native.SetForegroundWindow(hwnd);
-                    switched = switched || set2;
-                    raiseInfo = "_top=" + top + "_notop=" + notop + "_set2=" + set2;
+                    bool top = false, notop = false; bool set2 = false;
+                    try
+                    {
+                        // 同样带 SWP_ASYNCWINDOWPOS：Z 序调整不值得拿 UI 线程去等目标线程
+                        // （同步版在目标不泵消息时实测 8 秒不返回，见 EnsureNotTopmost 注释）。
+                        top = Native.SetWindowPos(hwnd, Native.HWND_TOPMOST, 0, 0, 0, 0,
+                            Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE
+                            | Native.SWP_SHOWWINDOW | Native.SWP_ASYNCWINDOWPOS);
+                        Thread.Sleep(30);
+                        notop = Native.SetWindowPos(hwnd, Native.HWND_NOTOPMOST, 0, 0, 0, 0,
+                            Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE
+                            | Native.SWP_ASYNCWINDOWPOS);
+                        Thread.Sleep(15);
+                        set2 = Native.SetForegroundWindow(hwnd);
+                        switched = switched || set2;
+                    }
+                    finally
+                    {
+                        if (top && !notop) notop = EnsureNotTopmost(hwnd);
+                        raiseInfo = "_top=" + top + "_notop=" + notop + "_set2=" + set2;
+                    }
                 }
 
                 // 一行结果放进实时状态串，用户「提不到前台」时能直接看到卡在哪一步。
@@ -975,6 +1107,52 @@ namespace DeepSeekQuake
             return hwnd != IntPtr.Zero && Native.IsWindow(hwnd) && Native.IsWindowVisible(hwnd) && !IsOurs(hwnd);
         }
 
+        /// <summary>把目标窗口从「置顶」拉回普通 Z 序。失败会记一笔，便于诊断。</summary>
+        private void EnsureNotTopmost()
+        {
+            if (_hwnd == IntPtr.Zero || !Native.IsWindow(_hwnd)) return;
+            EnsureNotTopmost(_hwnd);
+        }
+
+        /// <summary>
+        /// 取消置顶的静态实现。**必须幂等**：对本来就是普通 Z 序的窗口调用也安全，
+        /// 因为它是「危险状态」的收尾动作，宁可多调一次。
+        ///
+        /// **绝不允许它阻塞**（这是「双击 Ctrl 收不回去」的直接成因之一）：
+        /// 同步 SetWindowPos 是跨进程调用，目标线程不泵消息时它会一直等——实测
+        /// `audit-2\host\NT_HostProbe` 的 t1：把目标线程冻结后同步 SetWindowPos
+        /// **8000ms 都没返回**，只有结束那个进程才返回；对照响应正常的窗口是 0ms。
+        /// 而这个调用在 Hide() 的收尾里是**无条件**执行的，于是 Hide() 会挂在那里，
+        /// UI 线程上的 WM_APP_TOGGLE 永远排不到 → 用户怎么按都收不回去。
+        ///
+        /// 所以这里按目标线程状态分两路，两条路都保证立刻返回：
+        ///   * 不泵消息 → 只改扩展样式位 + 异步投递 SWP_ASYNCWINDOWPOS；
+        ///   * 在泵消息 → 同样用异步版本，让目标线程自己按顺序处理，我们不等。
+        /// 置顶不是「正确性」动作（它是「顺手拉回 Z 序」的兜底），用不着为它冒险。
+        /// </summary>
+        private static bool EnsureNotTopmost(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero || !Native.IsWindow(hwnd)) return true;
+
+            // 第一手：直接改扩展样式位，去掉 WS_EX_TOPMOST。这一步是本地内存操作
+            // （写我们自己映射到的窗口结构，不跨线程等待），不泵消息的窗口也能生效，
+            // 而且比 SetWindowPos 更直接——置顶状态本身就是这个样式位。
+            long ex = 0;
+            try
+            {
+                ex = Native.GetWindowLongPtr(hwnd, Native.GWL_EXSTYLE);
+                if ((ex & Native.WS_EX_TOPMOST) != 0)
+                    Native.SetWindowLongPtr(hwnd, Native.GWL_EXSTYLE, ex & ~Native.WS_EX_TOPMOST);
+            }
+            catch { /* 跨进程写窗口样式失败不致命，下面还有异步 SetWindowPos */ }
+
+            // 第二手：异步 SetWindowPos 让 Z 序也真正落回 NOTOPMOST。
+            // SWP_ASYNCWINDOWPOS = 调用线程与目标线程不同时，把请求投递到对方队列后立刻返回。
+            return Native.SetWindowPos(hwnd, Native.HWND_NOTOPMOST, 0, 0, 0, 0,
+                Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE
+                | Native.SWP_ASYNCWINDOWPOS);
+        }
+
         private IntPtr FindNextUsableWindow()
         {
             IntPtr h = Native.GetWindow(_hwnd, Native.GW_HWNDNEXT);
@@ -997,7 +1175,7 @@ namespace DeepSeekQuake
             Native.SetWindowLongPtr(hwnd, Native.GWL_EXSTYLE, want);
             Native.SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0,
                 Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOZORDER
-                | Native.SWP_NOACTIVATE | Native.SWP_FRAMECHANGED);
+                | Native.SWP_NOACTIVATE | Native.SWP_FRAMECHANGED | Native.SWP_ASYNCWINDOWPOS);
         }
 
         // ── 鼠标捕获 / 模态清理 ────────────────────────────────────
@@ -1022,15 +1200,99 @@ namespace DeepSeekQuake
         }
 
         /// <summary>
-        /// 右键抬起被钩子吞掉后，Chromium 可能以为鼠标还按着、继续持有 capture。
-        /// 窗口可见且在前台时这会让「下一击」落进 Chrome；窗口收起后虽不会截输入，
-        /// 但残留状态没有意义，所以这里补一次 WM_CANCELMODE 并校验。
+        /// 目标窗口所在 UI 线程此刻是否在泵消息。
+        ///
+        /// 为什么必须知道这件事：`ShowWindowAsync` 只是往目标线程的消息队列里投一条请求，
+        /// 它会**立刻返回 true，却什么也不做**——如果那个线程没在处理消息（卡住、或正待在
+        /// 原生菜单/模态循环里）。实测证据：`win32probe\out\p1_matrix.txt` CASE 4，
+        /// 对已标记 hung 的窗口调 `ShowWindowAsync(SW_HIDE)`，0~2ms 返回 True，
+        /// 而 `IsWindowVisible` 一直是 True。
+        ///
+        /// 反过来，同步的 `ShowWindow` / `SetWindowPos` 在目标线程不泵消息时会**永久阻塞**
+        /// （同文件 CASE 5/6：45 秒都没返回），所以只有在确认它在泵消息之后才敢用同步版本。
+        ///
+        /// 用 `SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG, 150ms)` 探测：
+        /// 目标线程不响应时，`SMTO_ABORTIFHUNG` 会让它**立刻**返回 0（不等满 150ms），
+        /// 所以这个探测本身很便宜，不会拖慢收起动作。
+        /// </summary>
+        public bool TargetThreadPumping { get { return IsPumping(_hwnd); } }
+
+        private static bool IsPumping(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero || !Native.IsWindow(hwnd)) return false;
+            IntPtr result;
+            return Native.SendMessageTimeout(hwnd, Native.WM_NULL, IntPtr.Zero, IntPtr.Zero,
+                Native.SMTO_ABORTIFHUNG, 150, out result) != IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// 目标窗口是不是「真的看不见」。两个权威信号必须**同时**同意才算收起：
+        /// `IsWindowVisible` 和 `GWL_STYLE & WS_VISIBLE`。
+        ///
+        /// 为什么只用这两个：它们读的是同一份窗口样式状态，是「隐藏了没有」的权威来源。
+        /// **不要**用 `GetWindowPlacement().showCmd` 做判断——实测（repro\probe-hide-real.exe）
+        /// 窗口隐藏之后 showCmd 仍是 1（SW_SHOWNORMAL），它反映的是"上次显示用的命令"，
+        /// 不是当前可见性。我一开始把它当第三个信号，导致明明已经隐藏了却报失败。
+        /// </summary>
+        public bool ReallyHidden
+        {
+            get
+            {
+                if (_hwnd == IntPtr.Zero || !Native.IsWindow(_hwnd)) return true;
+                return IsReallyHidden(_hwnd);
+            }
+        }
+
+        private static bool IsReallyHidden(IntPtr hwnd)
+        {
+            if (Native.IsWindowVisible(hwnd)) return false;
+            if ((Native.GetWindowLongPtr(hwnd, Native.GWL_STYLE) & Native.WS_VISIBLE) != 0) return false;
+            return true;
+        }
+
+        /// <summary>把上面那条「为什么还说它可见」的判定结果变成一行诊断文本。</summary>
+        public string VisibleDiagnosis
+        {
+            get
+            {
+                if (_hwnd == IntPtr.Zero || !Native.IsWindow(_hwnd)) return "无窗口";
+                bool vis = Native.IsWindowVisible(_hwnd);
+                bool styleVis = (Native.GetWindowLongPtr(_hwnd, Native.GWL_STYLE) & Native.WS_VISIBLE) != 0;
+                return "vis=" + (vis ? 1 : 0)
+                    + " style=" + (styleVis ? 1 : 0)
+                    + " hung=" + (Native.IsHungAppWindow(_hwnd) ? 1 : 0)
+                    + " pump=" + (IsPumping(_hwnd) ? 1 : 0)
+                    + " tries=" + _lastHideTries
+                    + " pend=" + (_hidePending ? 1 : 0);
+            }
+        }
+        /// <summary>
+        /// 清掉目标窗口残留的鼠标捕获（capture）。
+        ///
+        /// **为什么这一条直接决定「别的页面还能不能点」**：
+        /// 实测（win32probe\out\p5_rbutton.txt 场景 C/C2）——一个持有 capture 的窗口
+        /// **即使已经被隐藏**，仍然会继续收到鼠标消息：躲开它、点在别的窗口上，
+        /// WM_LBUTTONDOWN 还是被投递给那个隐藏的持有者。也就是说，只要 capture 没清掉，
+        /// 用户点哪里都"没反应"，看起来就是「整个桌面点不动」。
+        ///
+        /// 而 capture 泄漏正是右键粘贴的必然副作用：本工具的鼠标钩子吞掉了
+        /// WM_RBUTTONUP，页面收到 RBUTTONDOWN 后 SetCapture 了，却永远等不到抬起
+        /// （实测场景 B：capture 停在 0x640E16 不放）。同文件场景 C2 也证明
+        /// WM_CANCELMODE 能把它清干净，所以这里补发并校验。
+        ///
+        /// 放在 Hide() 的收尾：用户右键之后想收起时，顺手把这份残留状态一起清掉，
+        /// 保证收起之后别的窗口能正常接收点击。
         /// </summary>
         public void ReleaseLeakedCapture()
         {
             if (!IsWindowAlive()) return;
-            if (!TryReleaseCapture(_hwnd, 3, 200))
-                _log.Add("右键粘贴：Chrome 仍持有鼠标捕获（已补发 WM_CANCELMODE 仍未清掉）");
+            IntPtr cap = CaptureWindowOf(_hwnd);
+            if (cap == IntPtr.Zero) return;          // 绝大多数情况：没有泄漏，直接返回
+            if (!TryReleaseCapture(_hwnd, 2, 120))
+                _log.Add("目标窗口仍持有鼠标捕获（已补发 WM_CANCELMODE 仍未清掉）："
+                    + "此时点其它窗口也会被投递给它，表现为「桌面点不动」");
+            else
+                _log.Add("已清掉残留的鼠标捕获（右键抬起被吞掉留下的）");
         }
 
         /// <summary>
@@ -1046,7 +1308,7 @@ namespace DeepSeekQuake
                 if (cap == IntPtr.Zero) return true;
                 SendCancelMode(cap, perTryTimeoutMs);
                 SendCancelMode(hwnd, perTryTimeoutMs);
-                Thread.Sleep(30);
+                Thread.Sleep(20);
             }
             return CaptureWindowOf(hwnd) == IntPtr.Zero;
         }
@@ -1054,12 +1316,18 @@ namespace DeepSeekQuake
         /// <summary>
         /// 清捕获 + 模态。返回 true = 捕获已确认解除
         /// （焦点/窗口自身的 WM_CANCELMODE 只是尽力而为）。
+        ///
+        /// **超时预算必须小**：这个函数在 UI 线程上被 Hide() 调用，而低级鼠标钩子的
+        /// 回调就挂在这个线程上。旧值是 3 × (150+150) + 2 × 300 ≈ 1.6 秒，单独一项就把
+        /// UI 线程按住超过 LowLevelHooksTimeout（约 300ms），于是钩子被系统静默摘掉、
+        /// 全系统鼠标输入跟着卡——这正是「右键之后收不回去、别的页面也点不动」。
+        /// 现在最多 1 × (80+80) + 2 × 60 ≈ 280ms，且正常情况下 capture 为空时是 0ms。
         /// </summary>
         private bool CancelMouseModes(IntPtr hwnd)
         {
             if (hwnd == IntPtr.Zero || !Native.IsWindow(hwnd)) return true;
 
-            bool captureCleared = TryReleaseCapture(hwnd, 3, 150);
+            bool captureCleared = TryReleaseCapture(hwnd, 1, 80);
 
             uint pid;
             uint tid = Native.GetWindowThreadProcessId(hwnd, out pid);
@@ -1068,13 +1336,13 @@ namespace DeepSeekQuake
                 Native.GUITHREADINFO gti = new Native.GUITHREADINFO();
                 gti.cbSize = Marshal.SizeOf(typeof(Native.GUITHREADINFO));
                 if (Native.GetGUIThreadInfo(tid, ref gti))
-                    SendCancelMode(gti.hwndFocus, 300);
+                    SendCancelMode(gti.hwndFocus, 60);
             }
-            SendCancelMode(hwnd, 300);
+            SendCancelMode(hwnd, 60);
             return captureCleared;
         }
 
-        private static bool SendCancelMode(IntPtr hwnd, uint timeoutMs = 300)
+        private static bool SendCancelMode(IntPtr hwnd, uint timeoutMs = 60)
         {
             if (hwnd == IntPtr.Zero || !Native.IsWindow(hwnd)) return true;
             IntPtr result;
@@ -1162,6 +1430,13 @@ namespace DeepSeekQuake
                         {
                             _armed = false;
                             if (_stats != null) _stats.NoteUp();
+                            // ★ 关键：把这次抬起被吞掉的事实同步给共享鼠标状态。
+                            // 钩子链是**后装的先跑**，本钩子（装得晚）先看到这条 up 并
+                            // return 1，热键那条守卫钩子就再也收不到它了。若不一并更正，
+                            // 守卫方会以为右键一直按着 → 第一敲永不武装 → 此后每一次
+                            // 双击 Ctrl 都被静默忽略（用户症状：右键点一下之后收不回去）。
+                            // 详见 Native.NoteRmbUpSwallowed 的注释。
+                            Native.NoteRmbUpSwallowed();
                             // 不在这里做粘贴：钩子回调必须尽快返回，否则系统输入会卡。
                             // 回消息循环，等页面自己把菜单/选区处理完再注入 Ctrl+V。
                             PostPaste();

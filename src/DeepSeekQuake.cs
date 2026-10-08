@@ -116,7 +116,7 @@ namespace DeepSeekQuake
                 // 必须兜住异常：这是消息循环里的入口，抛出去会直接把整个小工具干掉，
                 // 表现就是「按一次热键之后托盘图标没了、热键也不灵了」。
                 Program.NoteToggleMessage();
-                try { Program.ToggleWindow(); }
+                try { Program.ToggleWindow(m.WParam); }
                 catch (Exception ex) { Program.Diag.Add("切换消息处理异常: " + ex); }
                 return;
             }
@@ -146,7 +146,7 @@ namespace DeepSeekQuake
             if (m.Msg == (int)Native.WM_APP_TOGGLE)
             {
                 Program.NoteToggleMessage();
-                try { Program.ToggleWindow(); }
+                try { Program.ToggleWindow(m.WParam); }
                 catch (Exception ex) { Program.Diag.Add("诊断窗口切换消息异常: " + ex.Message); }
                 return;
             }
@@ -162,7 +162,7 @@ namespace DeepSeekQuake
     internal static class Program
     {
         public const string Title = "DeepSeek Quake";
-        public const string Version = "2.0";
+        public const string Version = "2.1";
 
         // ── 全局状态 ───────────────────────────────────────────────
         public static Log Diag = new Log();
@@ -203,7 +203,17 @@ namespace DeepSeekQuake
         private static int _integrityRid;              // 当前进程完整性级别（低完整性会让钩子收不到输入）
         private static bool _lowIntegrity;
         private static int _toggleMessages;            // 收到的 WM_APP_TOGGLE 条数
-        private static int _lastToggleDispatchTick;    // 最近一次投递切换消息的时间戳
+        private static int _lastToggleDoneTick;        // 最近一次「呼出/收起」真正执行完的时间戳
+        // 「忙时合并」用：一次切换在 UI 线程上执行期间收到的请求先记下来，做完再判断。
+        private static bool _toggleBusy;
+        private static bool _togglePending;            // 忙的时候收到过请求
+        private static int _togglePendingTick;
+        private static bool _lastToggleOk = true;      // 最近一次切换是否确认生效（决定要不要补做）
+        private static int _toggleMerged;              // 累计合并掉的重复请求数（诊断用）
+        private static int _hideNotConfirmedCount;     // 累计「收起没能确认生效」次数（诊断用）
+        private static int _showNotConfirmedCount;     // 累计「呼出没能确认生效」次数（诊断用）
+        private static int _hookLivenessReinstalls;    // 因为「键按了但钩子没报」而重装的次数
+        private static int _lastHookReinstallTick;
         private static bool _trayNeedsRestore;         // explorer 重启后要把托盘图标挂回来
         private static bool _trayUnavailable;          // 系统没有通知区域（没有 explorer 的任务栏）
 
@@ -362,14 +372,18 @@ namespace DeepSeekQuake
                     + "（都为 0 说明钩子根本没收到事件）");
                 sb.AppendLine("  双击触发次数=" + _hotkeys.DoubleTapFires);
                 sb.AppendLine("  收到的 WM_HOTKEY 次数=" + _hotkeys.ChordFires);
-                sb.AppendLine("  主动重装钩子次数=" + _hotkeys.HookReinstalls);
+                sb.AppendLine("  主动重装钩子次数=" + _hotkeys.HookReinstalls
+                    + "（线程/句柄不在了）");
+                sb.AppendLine("  因「键按了但钩子没报」重装次数=" + _hookLivenessReinstalls
+                    + "（>0 说明钩子被系统静默摘掉过，已自动救回来）");
                 if (!string.IsNullOrEmpty(_hotkeyProblem)) sb.AppendLine("  上次失败原因: " + _hotkeyProblem);
             }
             sb.AppendLine();
 
             sb.AppendLine("[切换]");
             sb.AppendLine("  切换执行次数=" + _toggleCount);
-            sb.AppendLine("  收起次数=" + _hideCount + "  呼出次数=" + _showCount);
+            sb.AppendLine("  收起次数=" + _hideCount + "  呼出次数=" + _showCount
+                + "  其中收起未确认生效=" + _hideNotConfirmedCount);
             sb.AppendLine("  收到的切换消息=" + _toggleMessages + "（少于上面的触发次数就说明消息没被处理）");
             sb.AppendLine("  UI 心跳计数=" + _uiHeartbeat + "  卡顿次数(>1.5s)=" + _slowTickCount);
             sb.AppendLine("  查找请求=" + _findRequests + "  启动浏览器尝试=" + _launchAttempts);
@@ -958,7 +972,11 @@ namespace DeepSeekQuake
 
             // 健康检查：低级键盘钩子可能被系统悄悄摘掉（第一次能用、第二次没反应
             // 就是这个原因）。定期检查，被摘掉就装回来。
-            if (_hotkeys != null) _hotkeys.EnsureKeyboardHookAlive();
+            if (_hotkeys != null)
+            {
+                _hotkeys.EnsureKeyboardHookAlive();
+                DetectSilentlyDroppedHook();
+            }
 
             // 托盘图标可能因为 explorer 重启等原因消失，发现没了就重新挂上
             EnsureTrayAlive();
@@ -966,6 +984,7 @@ namespace DeepSeekQuake
             if (_host.IsWindowAlive())
             {
                 _host.EnsureToolWindow(_host.TargetWindow);
+                _host.VerifyHideLanded();          // 上一拍收起没落地就补一次
                 // 热键之前没启用成功就再试（例如占用它的程序退出了）。
                 // 条件必须是「有失败原因」——_hotkeyProblem 只有在失败时才非空，
                 // 成功时是 null。旧版这里写反了，所以这条重试永远不会发生。
@@ -1001,6 +1020,51 @@ namespace DeepSeekQuake
             UpdateTrayText();
         }
 
+        /// <summary>
+        /// 抓「钩子被系统静默摘掉」——这是最难查的一种失效：
+        /// 低级钩子的回调超过 LowLevelHooksTimeout（默认约 300ms）时，Windows 会把它从
+        /// 钩子链里摘掉，**但不通知、也不改变 SetWindowsHookEx 返回的句柄**。于是
+        /// KeyboardHookInstalled（只查句柄和线程）依旧为 true，诊断显示「钩子已安装」，
+        /// 用户却怎么按都没反应，只有重启才能恢复。
+        ///
+        /// 判定办法：目标修饰键**物理上确实按着**（GetAsyncKeyState 的 0x8000 位），
+        /// 但钩子已经连续 400ms 一个事件都没收到。正常情况按下瞬间回调就到了，所以这个
+        /// 组合只可能是钩子已经不在链上。
+        ///
+        /// 为什么不用「安静 1.5 秒就重装」那种判据：用户不碰键盘时钩子本来就该安静，
+        /// 那样写会变成一直重装的活锁。必须由「键真的按了」来触发。
+        /// 另外加 3 秒节流：重装本身有成本，且重装后要给它一点时间证明自己能用。
+        /// </summary>
+        private static void DetectSilentlyDroppedHook()
+        {
+            if (_hotkeys == null) return;
+            TriggerSpec act = _hotkeys.Active;
+            if (act == null || act.Kind != TriggerKind.DoubleTap) return;
+
+            int now = Environment.TickCount;
+            int last = _hotkeys.LastHookEventTick;
+            if (last == 0) return;                                  // 还没收到过任何事件，别急着判
+            if (unchecked(now - last) < HOOK_SILENCE_MS) return;     // 钩子最近还在报事件
+
+            if (!Native.IsDown(act.TapModifierVk)) return;           // 键没按着 → 安静是正常的
+
+            if (_lastHookReinstallTick != 0
+                && unchecked(now - _lastHookReinstallTick) < HOOK_REINSTALL_THROTTLE_MS) return;
+
+            _lastHookReinstallTick = now;
+            _hookLivenessReinstalls++;
+            Diag.Add("检测到「" + TriggerSpec.ModifierName(act.TapModifierVk)
+                + " 键确实按着，但键盘钩子 " + HOOK_SILENCE_MS + "ms 没收到任何事件」"
+                + "——系统很可能已把钩子静默摘掉，正在重装（第 " + _hookLivenessReinstalls + " 次）");
+            string why = _hotkeys.ReinstallKeyboardHook();
+            Diag.Add(why == null
+                ? "钩子已重装，双击热键恢复"
+                : "钩子重装失败: " + why);
+        }
+
+        private const int HOOK_SILENCE_MS = 400;
+        private const int HOOK_REINSTALL_THROTTLE_MS = 3000;
+
         private static void UpdateTraceTitle()
         {
             if (_traceHwnd == IntPtr.Zero) return;
@@ -1022,7 +1086,20 @@ namespace DeepSeekQuake
                     + " kmod=" + (_hotkeys == null ? "0" : _hotkeys.ModifierEvents.ToString())
                     + " ck=" + (_hotkeys == null ? "0" : _hotkeys.ChordFires.ToString())
                     + " hkr=" + (_hotkeys == null ? "0" : _hotkeys.HookReinstalls.ToString())
+                    + " hkl=" + _hookLivenessReinstalls
+                    + " hfail=" + _hideNotConfirmedCount
+                    + " showfail=" + _showNotConfirmedCount
+                    + " hid=[" + (_host.VisibleDiagnosis ?? "") + "]"
+                    + " realhid=" + (_host.ReallyHidden ? "1" : "0")
                     + " tog=" + _toggleCount + " h=" + _hideCount + " s=" + _showCount
+                    + " mg=" + _toggleMerged
+                    // cap：目标线程当前持有的鼠标捕获窗口。非 0 表示「有一个隐藏的窗口
+                    // 正在偷走全桌面的点击」——用户症状二（别的页面点不动）的指纹。
+                    + " cap=0x" + _host.TargetThreadCapture.ToInt64().ToString("X")
+                    // rmb：右键抬起被吞掉的累计次数。这是「右键之后双击 Ctrl 收不回去」
+                    // 那条链路的关键计数——被吞一次就会让鼠标状态中毒，必须由
+                    // NoteRmbUpSwallowed 主动更正（见 Native 里的说明）。
+                    + " rmb=" + Native.SwallowedRmbUps
                     + " tm=" + _toggleMessages + " hb=" + _uiHeartbeat + " slow=" + _slowTickCount
                     + " d=" + Stats.Down + " u=" + Stats.Up + " p=" + Stats.Paste
                     + " fgr=" + (_host.LastForegroundResult ?? "")
@@ -1228,12 +1305,17 @@ namespace DeepSeekQuake
         /// </summary>
         private static void PostToggleMessage()
         {
-            _lastToggleDispatchTick = Environment.TickCount;
             try
             {
                 if (_msg != null && !_msg.IsDisposed && _msg.IsHandleCreated)
                 {
-                    bool ok = Native.PostMessage(_msg.Handle, Native.WM_APP_TOGGLE, IntPtr.Zero, IntPtr.Zero);
+                    // wParam 带上「投递时刻」。UI 线程忙上一次切换时，用户连按的
+                    // 第二组双击会排在消息队列里；等上一次刚做完它会立刻执行，
+                    // 把刚收起的窗口又呼出来（表现为「双击 Ctrl 收不回去」）。
+                    // 带时间戳后，ToggleWindowCore 能认出这是上一次完成之前按下的
+                    // 重复请求并丢弃它。
+                    int stamp = Environment.TickCount;
+                    bool ok = Native.PostMessage(_msg.Handle, Native.WM_APP_TOGGLE, (IntPtr)stamp, IntPtr.Zero);
                     if (!ok) Diag.Add("投递切换消息失败（PostMessage 返回 false）");
                 }
                 else
@@ -1246,13 +1328,19 @@ namespace DeepSeekQuake
 
         public static void NoteToggleMessage() { _toggleMessages++; }
 
-        // 供托盘菜单「呼出/收起」和热键回调使用
-        public static void ToggleWindow()
+        // 供托盘菜单「呼出/收起」和组合键热键使用（不带排队时间戳）
+        public static void ToggleWindow() { ToggleWindow(IntPtr.Zero); }
+
+        /// <summary>
+        /// 切换入口。WM_APP_TOGGLE 会把热键钩子投递消息那一刻的 TickCount 放在
+        /// wParam 里带进来；postedTick=0 表示不是从消息队列来的（托盘 / 组合键）。
+        /// </summary>
+        public static void ToggleWindow(IntPtr postedTick)
         {
             if (_quitting) return;
             try
             {
-                ToggleWindowCore();
+                ToggleWindowCore(postedTick == IntPtr.Zero ? 0 : postedTick.ToInt32());
             }
             catch (Exception ex)
             {
@@ -1261,10 +1349,105 @@ namespace DeepSeekQuake
             }
         }
 
-        private static void ToggleWindowCore()
+        private static void ToggleWindowCore(int postedTick)
         {
             if (_quitting) return;
+
+            // 忙时合并（重要）：一次呼出/收起会在 UI 线程上做跨进程窗口操作，可能占用
+            // 上百毫秒。这期间用户再双击 Ctrl，投递进来的消息只能排在队列里等。
+            //
+            // 旧版在这里用「投递时刻早于我上次完成」判定为「重复请求」直接丢弃，想解决
+            // 「上一次刚收起就被紧接着的第二组双击又呼出来」。但那个判据把**用户因为
+            // 没看到反应而补按的那一下**也一起丢了——它恰恰落在同一个时间窗里，结果
+            // 就是「按了没反应，再按还是没反应」。而且它没有任何反馈，用户只能重启。
+            //
+            // 现在改成：忙的时候把请求记下来（带请求序号），这一次做完之后再看要不要补做。
+            // 用来区分「同一组连按」和「用户补按」的是**请求序号**，不是时间戳：
+            //   * 连按两下产生的两个请求，序号相邻，中间没有别的切换；
+            //   * 用户因为没看到反应而补按，也同样是相邻序号 —— 所以只靠序号不够，
+            //     还要看**上一次切换有没有达到用户要的状态**（见下面的 recall 判断）。
+            // 最终判据：如果请求是在上一次切换**开始之后**才来的，说明用户是在没看到
+            // 结果的情况下按的；此时若窗口状态已经等于他要的状态，就什么都不用做，
+            // 否则补做一次。两种意图都能满足，且永不静默丢弃。
+            // ── 重复请求合并（「收不回去」的直接防线）─────────────────────────
+            // 一次呼出/收起会做跨进程窗口操作，正常情况下也要 30~300ms 才从屏幕上消失。
+            // 用户在这个窗口期内绝不会只双击一次：他每按一轮就投一条 WM_APP_TOGGLE，
+            // 而 wParam 带的是**钩子投递那一刻**的 TickCount。
+            //
+            // 关键：如果这条请求的投递时刻**早于上一次切换完成**，说明用户是在还没看到
+            // 结果的时候按的 —— 那一次切换其实已经生效了。此时若放它过去，第二次会看到
+            // `Visible==false` 而执行 **Show()**，窗口就被自己按回来了：用户看到的正是
+            // 「右键之后双击 Ctrl 收不回去」。
+            //
+            // 所以：投递早于上次完成 且 上次确实生效 → 合并掉，不再反向切一次。
+            // 反过来，上次**没**生效（_lastToggleOk==false）时必须放行——那才是用户
+            // 补救的那一按，静默丢弃就变成「按了没反应，只能重启」（旧版的错误）。
+            if (postedTick != 0 && _lastToggleOk && _lastToggleDoneTick != 0
+                && unchecked(postedTick - _lastToggleDoneTick) < 0)
+            {
+                _toggleMerged++;
+                Diag.Add("合并一次重复的呼出/收起请求（投递早于上次完成 " +
+                    unchecked(_lastToggleDoneTick - postedTick) + "ms，且上次已生效）");
+                return;
+            }
+
+            if (_toggleBusy)
+            {
+                _togglePending = true;
+                _togglePendingTick = postedTick;
+                return;
+            }
+            _toggleBusy = true;
+            int recallTick = 0;
+            bool recall = false;
+            try
+            {
+                DoToggle(postedTick);
+            }
+            catch (Exception ex)
+            {
+                Diag.Add("切换动作异常（已忽略，工具继续运行）: " + ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                // 必须在动作真正做完之后才记时间：诊断里能看出「这一下到底忙了多久」。
+                _lastToggleDoneTick = Environment.TickCount;
+                _toggleBusy = false;
+
+                // 忙的时候攒下来的请求：**只有当它确实还没被满足时**才补做。
+                //
+                // 这里要同时满足两种真实意图，之前两版各错一边：
+                //   (a) 用户连按两下（第一次其实成功了，只是他按第二次时还没看到结果）
+                //       → 补做会把刚刚收起的窗口又呼出来，就是「收不回去」。
+                //   (b) 第一次**没成功**（窗口没真隐藏 / 没真显示），用户又按了一下
+                //       → 不补做就是「按了没反应」，用户只能重启（旧版就是静默丢弃）。
+                //
+                // 所以判据是「上一次动作成功了没有」，而不是「消息是什么时候到的」：
+                // 成功了就不再重复他的意图，失败了就再试一次。
+                if (_togglePending && !_lastToggleOk)
+                {
+                    recall = true;
+                    recallTick = _togglePendingTick;
+                    Diag.Add("上一次切换没能确认生效，补做一次用户又按下的呼出/收起请求");
+                }
+                else if (_togglePending)
+                {
+                    Diag.Add("忽略重复的呼出/收起请求（上一次已经生效，用户是按完才看到结果）");
+                }
+                _togglePending = false;
+                _togglePendingTick = 0;
+            }
+
+            // 补做放在 finally 之外：finally 里不允许 return，而且补做本身要重新走一遍
+            // 「忙时合并」的入口，递归调用必须发生在本次已经彻底收尾之后。
+            if (recall) ToggleWindowCore(recallTick);
+        }
+
+        /// <summary>真正做一次呼出 / 收起。调用方保证同一时刻只有一个在执行。</summary>
+        private static void DoToggle(int postedTick)
+        {
             _toggleCount++;
+            _lastToggleOk = true;  // 先当成功；下面任何一步没确认到就改成 false
             Diag.Add("切换窗口（当前 hwnd=" + (_host.IsWindowAlive() ? "有" : "无")
                 + " vis=" + (_host.Visible ? "1" : "0")
                 + " 前台是我们=" + (_host.IsOursForeground() ? "1" : "0") + "）");
@@ -1279,21 +1462,34 @@ namespace DeepSeekQuake
                 return;
             }
 
-            // 判断顺序：
-            //   1. 可见且在前台 → 收起；
-            //   2. 可见但不在前台 → 先尝试提到前台（正常应用前台锁允许）；
-            //   3. 如果上一次「提到前台」已被系统拒绝（前台是更高权限的窗口等），
-            //      这一次直接收起，保证用户总能按第二下把窗口收走，不会卡在
-            //      「可见但被挡住 / 又没任务栏和 Alt+Tab」的死角。
-            if (_host.Visible && (_host.IsOursForeground() || _host.LastShowMissedForeground))
+            // 只要窗口可见就收起，**不看它是不是前台**。
+            // 旧逻辑在「可见但不在前台」时会先尝试提到前台，理由是没有任务栏 /
+            // Alt+Tab，被挡住时更需要呼出；但真实使用里这个状态太常见了：
+            // 窗口显示着，用户点了别的程序，再双击 Ctrl 想收回去，结果只被提到
+            // 前台、收不回去。标准 quake 终端的做法是可见即收起；窗口真被挡住时
+            // 再按一次就会显示到前台，不会卡住。
+            if (_host.Visible)
             {
                 _hideCount++;
-                _host.Hide();
+                _lastToggleOk = _host.Hide();
+                if (!_lastToggleOk)
+                {
+                    _hideNotConfirmedCount++;
+                    Diag.Add("收起没能确认生效（窗口可能被浏览器卡住），会在心跳里复核并允许用户再按一次");
+                }
             }
             else
             {
                 _showCount++;
                 _host.Show();
+                // Show 内部按「真的可见了」重试，这里按同一标准复核；
+                // 复核失败时允许用户的下一按补做，避免「按了没反应」。
+                _lastToggleOk = _host.Visible;
+                if (!_lastToggleOk)
+                {
+                    _showNotConfirmedCount++;
+                    Diag.Add("呼出没能确认生效（窗口仍未可见），允许用户再按一次补做");
+                }
             }
             UpdateTrayText();
         }
@@ -1307,9 +1503,13 @@ namespace DeepSeekQuake
             ThreadPool.QueueUserWorkItem(delegate(object s)
             {
                 Thread.Sleep(60);
-                // 自己注入的 Ctrl 不能参与双击判定：先清掉可能已武装的「第一敲」，
-                // 再给 4 个注入事件打上 DSQ_EXTRAINFO 标记（钩子两道都会跳过）。
-                try { if (_hotkeys != null) _hotkeys.SuppressPendingTap(); } catch { }
+                // 注意：这里**不要**再调 HotkeyManager.SuppressPendingTap()。
+                // 注入的 4 个事件都带 DSQ_EXTRAINFO 标记，KeyboardProc 里已经直接跳过，
+                // 它们本来就不可能被当成「第二敲」。而 SuppressPendingTap 会把
+                // 用户刚刚真实按下的、已经完整结束的一次干净敲击也一起抹掉
+                // （_tapPending=false、_tapDirty=true），于是「按一下 Ctrl → 右键粘贴 →
+                // 再按一下 Ctrl」本来该触发双击的，被吃掉一次。旧版是双重保险，
+                // 实际只误伤了真实按键。
                 Native.INPUT[] inputs = new Native.INPUT[4];
                 inputs[0] = MakeKeyInput(Native.VK_CONTROL, false);
                 inputs[1] = MakeKeyInput(Native.VK_V, false);

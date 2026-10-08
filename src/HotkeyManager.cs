@@ -124,6 +124,12 @@ namespace DeepSeekQuake
         public int HookEvents { get { return _hookEvents; } }
         public int ModifierEvents { get { return _modEvents; } }
         public int HookInstallAttempts { get { return _hookInstallAttempts; } }
+        /// <summary>
+        /// 钩子最后一次收到键盘事件的 TickCount（0 = 本次安装后一次都没收到）。
+        /// 供「钩子被系统静默摘掉」的检测使用：键物理上按着、但这个时间戳很久没动，
+        /// 就说明钩子已经不在链上了。**int 读写在 32 位对齐下是原子的**，不需要锁。
+        /// </summary>
+        public int LastHookEventTick { get { return _lastHookEventTick; } }
 
         /// <summary>已注册成功的「动作热键」列表，用于托盘提示 / 诊断显示。</summary>
         public List<string> RegisteredActionLabels
@@ -341,6 +347,7 @@ namespace DeepSeekQuake
                 _awaitRelease = false;
                 _modifierHeld = false;
                 _lastTapTick = 0;
+                _lastHookEventTick = 0;     // 新装的钩子从「一个事件都没收到」重新计
 
                 // 再挂一个只写脏标记的鼠标钩子（同为低级钩子，回调只写 bool）。
                 // 装不上不影响双击：只是 Ctrl+鼠标手势的过滤少一层，
@@ -376,20 +383,38 @@ namespace DeepSeekQuake
             }
             finally
             {
-                IntPtr h = _kbdHook;
-                _kbdHook = IntPtr.Zero;
-                if (h != IntPtr.Zero)
+                // 关键：退出清理必须**只清理自己装的那一份**。
+                // 旧版无条件把 _kbdHook 清成 Zero —— 如果此时已经有一个新线程装好了钩子
+                // （EnsureKeyboardHookAlive 重装、或用户在设置里改了热键），就会被这个
+                // 迟到的 finally 抹掉句柄：钩子其实还活着，但我们再也找不到它，
+                // 于是「检测到不在线 → 重装 → 旧线程 finally 又抹掉」变成活锁，
+                // 诊断里表现为重装次数疯涨、热键时好时坏。
+                //
+                // 用**托管线程身份**比对（_hookThreadIsMe）：只要 _hookThread 已经被别人
+                // 换掉，就说明不是我在管这些字段了。
+                if (_hookThread == null || _hookThread == Thread.CurrentThread)
                 {
-                    try { Native.UnhookWindowsHookEx(h); } catch { }
+                    IntPtr h = _kbdHook;
+                    _kbdHook = IntPtr.Zero;
+                    if (h != IntPtr.Zero)
+                    {
+                        try { Native.UnhookWindowsHookEx(h); } catch { }
+                    }
+                    IntPtr mh = _mouseHook;
+                    _mouseHook = IntPtr.Zero;
+                    if (mh != IntPtr.Zero)
+                    {
+                        try { Native.UnhookWindowsHookEx(mh); } catch { }
+                    }
+                    _hookThreadId = 0;
+                    _hookThread = null;
+                    if (_log != null) _log.Add("低级键盘钩子线程已退出");
                 }
-                IntPtr mh = _mouseHook;
-                _mouseHook = IntPtr.Zero;
-                if (mh != IntPtr.Zero)
+                else if (_log != null)
                 {
-                    try { Native.UnhookWindowsHookEx(mh); } catch { }
+                    // 已经有新线程接管：只摘自己这一份句柄（如果有），绝不动新线程的状态
+                    _log.Add("旧键盘钩子线程退出，但已有新线程接管，跳过句柄清理");
                 }
-                _hookThreadId = 0;
-                if (_log != null) _log.Add("低级键盘钩子线程已退出");
                 if (_hookReady != null) _hookReady.Set();   // 让安装方别死等
             }
         }
@@ -495,6 +520,18 @@ namespace DeepSeekQuake
         }
 
         /// <summary>
+        /// 此刻是否真有鼠标按键物理按着——**用共享记账，不用 GetAsyncKeyState**。
+        /// 完整机制说明见 <see cref="Native.IsAnyMouseButtonPhysicallyDown"/>：
+        /// 右键粘贴吞掉 WM_RBUTTONUP 后，GetAsyncKeyState(VK_RBUTTON) 的 0x8000 位
+        /// 会永远挂着，旧判据从此恒为真 → 第一敲永不武装 → 之后每次双击都被静默忽略
+        /// （用户症状：右键点一下之后双击 Ctrl 收不回去，诊断却全绿）。
+        /// </summary>
+        private bool IsAnyMouseButtonPhysicallyDown()
+        {
+            return Native.IsAnyMouseButtonPhysicallyDown();
+        }
+
+        /// <summary>
         /// 低级鼠标钩子：双击 Ctrl 期间，任何鼠标按键 / 滚轮动作都让这一次 Ctrl 按住作废。
         /// 这样 Ctrl+滚轮缩放、Ctrl+左键新标签、Ctrl+拖拽 的 Ctrl 抬起不会进入
         /// 「已敲了一下、等第二下」的状态。回调只写 bool，绝不做重活。
@@ -506,6 +543,19 @@ namespace DeepSeekQuake
                 if (nCode >= 0)
                 {
                     int msg = wParam.ToInt32();
+                    // 把真实按键状态记进**共享**状态（Native），不是本类私有字段：
+                    // 进程里有两条低级鼠标钩子，钩子链后装的先跑，右键粘贴那条会先看到
+                    // WM_RBUTTONUP 并吞掉它，本条守卫钩子根本收不到那次抬起。
+                    // 共享 + 由吞掉的一方主动更正（NoteRmbUpSwallowed），两边才自洽。
+                    if (msg == Native.WM_LBUTTONDOWN || msg == Native.WM_LBUTTONUP
+                        || msg == Native.WM_RBUTTONDOWN || msg == Native.WM_RBUTTONUP
+                        || msg == Native.WM_MBUTTONDOWN || msg == Native.WM_MBUTTONUP)
+                        Native.NoteMouseButton(msg,
+                            msg == Native.WM_LBUTTONDOWN | msg == Native.WM_RBUTTONDOWN
+                            | msg == Native.WM_MBUTTONDOWN);
+                    // 另外两处安全网（正常由 BrowserHost 那边调 NoteRmbUpSwallowed 更正）：
+                    // 手写抬起事件、以及「右键粘贴被关掉 / 窗口不在前台」这些不会吞抬起
+                    // 的路径，本条钩子自己就能看到 up，直接记账即可。
                     if (msg == Native.WM_LBUTTONDOWN || msg == Native.WM_RBUTTONDOWN
                         || msg == Native.WM_MBUTTONDOWN || msg == Native.WM_XBUTTONDOWN
                         || msg == Native.WM_MOUSEWHEEL || msg == Native.WM_MOUSEHWHEEL)
@@ -568,7 +618,7 @@ namespace DeepSeekQuake
                     }
 
                     // 鼠标键此刻还按着（Ctrl+拖拽之类）→ 这一轮也不算干净的一敲
-                    if (Native.IsAnyMouseButtonDown()) _tapDirty = true;
+                    if (IsAnyMouseButtonPhysicallyDown()) _tapDirty = true;
                     return;
                 }
 
@@ -594,7 +644,7 @@ namespace DeepSeekQuake
                     return;
                 }
 
-                if (_tapDirty || Native.IsAnyMouseButtonDown())
+                if (_tapDirty || IsAnyMouseButtonPhysicallyDown())
                 {
                     _tapPending = false;      // 这一轮是组合键 / 鼠标手势，不算一次敲击
                 }
@@ -688,6 +738,13 @@ namespace DeepSeekQuake
             _awaitRelease = false;
             _modifierHeld = false;
             _tapVk = 0;
+            // 必须一起清 _active：EnsureKeyboardHookAlive 是按「_active.Kind」决定要不要
+            // 装钩子的，如果只清 _tapVk 而留下 _active，下一拍就会把钩子**装回来**，
+            // 而 HandleKey 开头 `if (_tapVk == 0) return;` 会把所有按键丢掉。
+            // 结果是「钩子装上了、诊断全绿、按键全部无效」，且 TryArmHotkey 又被
+            // 「钩子已安装」挡住 → 永久哑巴，只能重启进程。
+            _active = null;
+            Native.ResetMouseButtonState();
         }
 
         public void Dispose() { Release(); }
